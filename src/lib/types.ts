@@ -59,6 +59,28 @@ export interface QuizStatsResponse {
   history: { userGuess: string; aiSentiment: string; correct: boolean; createdAt: string }[];
 }
 
+export interface NewsItem {
+  url: string;
+  title: string;
+  snippet: string;
+  host: string;
+  date: string;
+  favicon: string;
+}
+
+export interface ArticleContent {
+  url: string;
+  title: string;
+  text: string;
+  publishedTime?: string;
+}
+
+export interface FollowedTopic {
+  id: string;
+  name: string;
+  createdAt: string;
+}
+
 export type AnalyzeStreamEvent =
   | { event: "analysis"; data: { analysis: StructuredAnalysis; latencyMs: number; model: string } }
   | { event: "delta"; data: { t: string } }

@@ -8,6 +8,7 @@ import {
   History,
   Moon,
   Newspaper,
+  Rss,
   Sparkles,
   Sun,
 } from "lucide-react";
@@ -15,16 +16,19 @@ import {
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
 import { AnalyzePanel } from "@/components/news-sentiment/analyze-panel";
+import type { PendingAnalyzeRequest } from "@/components/news-sentiment/analyze-panel";
 import { DashboardPanel } from "@/components/news-sentiment/dashboard-panel";
 import { StudyPanel } from "@/components/news-sentiment/study-panel";
 import { HistoryPanel } from "@/components/news-sentiment/history-panel";
+import { LiveNewsPanel } from "@/components/news-sentiment/live-news-panel";
 import { fetchJSON } from "@/lib/sse-client";
 import type { ModelInfo } from "@/lib/types";
 
 type ApiStatus = "checking" | "online" | "offline";
-type TabKey = "analyze" | "dashboard" | "study" | "history";
+type TabKey = "live" | "analyze" | "dashboard" | "study" | "history";
 
 const TABS: { value: TabKey; label: string; icon: React.ElementType }[] = [
+  { value: "live", label: "Live News", icon: Rss },
   { value: "analyze", label: "Analyze", icon: Sparkles },
   { value: "dashboard", label: "Dashboard", icon: BarChart3 },
   { value: "study", label: "Study", icon: GraduationCap },
@@ -33,7 +37,8 @@ const TABS: { value: TabKey; label: string; icon: React.ElementType }[] = [
 
 export default function Home() {
   const [historyRefreshKey, setHistoryRefreshKey] = React.useState(0);
-  const [activeTab, setActiveTab] = React.useState<TabKey>("analyze");
+  const [activeTab, setActiveTab] = React.useState<TabKey>("live");
+  const [pendingArticle, setPendingArticle] = React.useState<PendingAnalyzeRequest | null>(null);
   const [apiStatus, setApiStatus] = React.useState<ApiStatus>("checking");
   const [modelCount, setModelCount] = React.useState(0);
   const [mounted, setMounted] = React.useState(false);
@@ -128,7 +133,7 @@ export default function Home() {
           onValueChange={(v) => setActiveTab(v as TabKey)}
           className="gap-6"
         >
-          <TabsList className="mx-auto grid h-auto w-full max-w-xl grid-cols-4 rounded-xl border bg-muted/50 p-1">
+          <TabsList className="mx-auto grid h-auto w-full max-w-2xl grid-cols-5 rounded-xl border bg-muted/50 p-1">
             {TABS.map((tab) => (
               <TabsTrigger
                 key={tab.value}
@@ -142,8 +147,19 @@ export default function Home() {
             ))}
           </TabsList>
 
+          <TabsContent value="live">
+            <LiveNewsPanel
+              onAnalyzeArticle={(req) => {
+                setPendingArticle({ ...req, ts: Date.now() });
+                setActiveTab("analyze");
+              }}
+            />
+          </TabsContent>
           <TabsContent value="analyze">
-            <AnalyzePanel onSaved={() => setHistoryRefreshKey((k) => k + 1)} />
+            <AnalyzePanel
+              onSaved={() => setHistoryRefreshKey((k) => k + 1)}
+              pending={pendingArticle}
+            />
           </TabsContent>
           <TabsContent value="dashboard">
             <DashboardPanel />

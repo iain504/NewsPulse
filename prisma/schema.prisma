@@ -47,3 +47,10 @@ model QuizRound {
   model       String
   createdAt   DateTime @default(now())
 }
+
+// A topic the user wants the live news feed to follow
+model FollowedTopic {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  createdAt DateTime @default(now())
+}

@@ -34,9 +34,19 @@ import { fetchJSON, postSSE } from "@/lib/sse-client";
 import { SAMPLE_NEWS, type SampleNews } from "@/lib/sample-news";
 import { SentimentGauge } from "./sentiment-gauge";
 
+export interface PendingAnalyzeRequest {
+  title: string;
+  source: string;
+  text: string;
+  /** Changing timestamp so each new request re-triggers the effect. */
+  ts: number;
+}
+
 interface AnalyzePanelProps {
   /** Called after an analysis is successfully saved (done event) so other tabs can refresh. */
   onSaved?: () => void;
+  /** Incoming article from the Live News feed — fills the form and auto-starts the analysis. */
+  pending?: PendingAnalyzeRequest | null;
 }
 
 const FALLBACK_MODELS = [
@@ -58,7 +68,7 @@ function formatLatency(ms: number): string {
   return ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms)}ms`;
 }
 
-export function AnalyzePanel({ onSaved }: AnalyzePanelProps) {
+export function AnalyzePanel({ onSaved, pending }: AnalyzePanelProps) {
   const [title, setTitle] = React.useState("");
   const [source, setSource] = React.useState("");
   const [text, setText] = React.useState("");
@@ -108,9 +118,11 @@ export function AnalyzePanel({ onSaved }: AnalyzePanelProps) {
     setStreamingTutor(false);
   }
 
-  async function runAnalysis() {
-    const trimmed = text.trim();
-    if (trimmed.length < 20 || phase === "running") return;
+  async function runAnalysis(overrides?: { text?: string; title?: string; source?: string }) {
+    const useText = (overrides?.text ?? text).trim();
+    const useTitle = (overrides?.title ?? title).trim();
+    const useSource = (overrides?.source ?? source).trim();
+    if (useText.length < 20 || phase === "running") return;
 
     abortRef.current?.abort();
     const controller = new AbortController();
@@ -126,9 +138,9 @@ export function AnalyzePanel({ onSaved }: AnalyzePanelProps) {
       await postSSE(
         "/api/analyze",
         {
-          text: trimmed,
-          title: title.trim() || undefined,
-          source: source.trim() || undefined,
+          text: useText,
+          title: useTitle || undefined,
+          source: useSource || undefined,
           model,
         },
         {
@@ -171,6 +183,20 @@ export function AnalyzePanel({ onSaved }: AnalyzePanelProps) {
   function cancelAnalysis() {
     abortRef.current?.abort();
   }
+
+  // Auto-start when an article arrives from the Live News feed.
+  React.useEffect(() => {
+    if (!pending?.text) return;
+    setTitle(pending.title);
+    setSource(pending.source);
+    setText(pending.text);
+    resetResult();
+    void runAnalysis({
+      text: pending.text,
+      title: pending.title,
+      source: pending.source,
+    });
+  }, [pending?.ts]);
 
   const canAnalyze = text.trim().length >= 20 && phase === "idle";
   const meta = analysis ? SENTIMENT_META[analysis.sentiment] : null;
