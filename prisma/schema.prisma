@@ -1,0 +1,49 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// A stored sentiment analysis of a news article
+model Analysis {
+  id         String   @id @default(cuid())
+  title      String
+  source     String?
+  content    String
+  // positive | negative | neutral | mixed
+  sentiment  String
+  // -1 .. 1
+  score      Float
+  // 0 .. 1
+  confidence Float
+  // JSON arrays / objects serialized as strings
+  emotions   String   @default("[]")
+  keywords   String   @default("[]")
+  entities   String   @default("[]")
+  summary    String   @default("")
+  reasoning  String   @default("")
+  // model used: edge0-35b | edge0-8b
+  model      String
+  latencyMs  Int      @default(0)
+  createdAt  DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([sentiment])
+}
+
+// One round of the "Guess the sentiment" study game
+model QuizRound {
+  id          String   @id @default(cuid())
+  headline    String
+  body        String   @default("")
+  userGuess   String   @default("")
+  aiSentiment String   @default("")
+  explanation String   @default("")
+  correct     Boolean  @default(false)
+  answered    Boolean  @default(false)
+  model       String
+  createdAt   DateTime @default(now())
+}
