@@ -254,6 +254,84 @@ export const SIGNAL_META: Record<
 export const TIMEFRAMES = ["5m", "15m", "1h", "4h", "1d"] as const;
 export type Timeframe = (typeof TIMEFRAMES)[number];
 
+// ---------------------------------------------------------------------------
+// Paper trading (simulated trades + P&L)
+// ---------------------------------------------------------------------------
+
+export type TradeDirection = "BUY" | "SELL";
+export type TradeExitReason = "TP" | "SL" | "MANUAL";
+
+export interface TradeRow {
+  id: string;
+  signalId: string | null;
+  symbol: string;
+  direction: TradeDirection;
+  entryPrice: number;
+  stopLoss: number;
+  takeProfit: number;
+  quantity: number;
+  notional: number;
+  status: "OPEN" | "CLOSED";
+  exitPrice: number | null;
+  pnl: number | null;
+  pnlPct: number | null;
+  exitReason: TradeExitReason | null;
+  openedAt: string;
+  closedAt: string | null;
+}
+
+/** OPEN trade enriched with the live market price for unrealized P&L. */
+export interface OpenTradeRow extends TradeRow {
+  currentPrice: number;
+  unrealizedPnl: number;
+  unrealizedPct: number;
+  /** 0..100 — how far price has travelled from SL (0) to TP (100). */
+  progressPct: number;
+}
+
+export interface TradeStats {
+  startBalance: number;
+  realizedPnl: number;
+  unrealizedPnl: number;
+  balance: number;
+  openCount: number;
+  closedCount: number;
+  wins: number;
+  losses: number;
+  /** 0..100 */
+  winRate: number;
+  bestPnl: number;
+  worstPnl: number;
+  totalVolume: number;
+}
+
+export interface TradesResponse {
+  ok: boolean;
+  open: OpenTradeRow[];
+  closed: TradeRow[];
+  stats: TradeStats;
+}
+
+export interface WatchItemRow {
+  id: string;
+  symbol: string;
+  scan: boolean;
+  createdAt: string;
+}
+
+export const NOTIONAL_OPTIONS = [100, 250, 500, 1000, 5000] as const;
+export const PAPER_START_BALANCE = 10_000;
+
+/** A BUY/SELL signal plotted on the candlestick chart. */
+export interface ChartMarker {
+  /** bar openTime (ms) the marker attaches to */
+  time: number;
+  direction: "BUY" | "SELL";
+  price: number;
+  /** iso timestamp of the originating signal */
+  at: string;
+}
+
 export const RISK_PROFILES: { value: string; label: string; hint: string }[] = [
   { value: "conservative", label: "Conservative", hint: "R:R ≥ 2.0 · confluence required" },
   { value: "balanced", label: "Balanced", hint: "R:R ≥ 1.8 · standard setups" },

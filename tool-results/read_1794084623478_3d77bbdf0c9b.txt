@@ -1,0 +1,881 @@
+     1→"use client";
+     2→
+     3→import * as React from "react";
+     4→import {
+     5→  Activity,
+     6→  ChevronDown,
+     7→  ChevronRight,
+     8→  Crosshair,
+     9→  Loader2,
+    10→  Play,
+    11→  Plus,
+    12→  Radio,
+    13→  RefreshCw,
+    14→  Timer,
+    15→  Trash2,
+    16→  X,
+    17→  Zap,
+    18→} from "lucide-react";
+    19→import { toast } from "sonner";
+    20→
+    21→import { Badge } from "@/components/ui/badge";
+    22→import { Button } from "@/components/ui/button";
+    23→import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+    24→import { Input } from "@/components/ui/input";
+    25→import { Progress } from "@/components/ui/progress";
+    26→import {
+    27→  Select,
+    28→  SelectContent,
+    29→  SelectItem,
+    30→  SelectTrigger,
+    31→  SelectValue,
+    32→} from "@/components/ui/select";
+    33→import { Switch } from "@/components/ui/switch";
+    34→import { CandleChart } from "@/components/trading/candle-chart";
+    35→import { SignalCard, type SignalStatus } from "@/components/trading/signal-card";
+    36→import { fetchJSON, postSSE } from "@/lib/sse-client";
+    37→import { formatCompact, formatPct, formatPrice, timeAgo } from "@/lib/format";
+    38→import {
+    39→  DEFAULT_SYMBOLS,
+    40→  RISK_PROFILES,
+    41→  SCAN_INTERVALS,
+    42→  SIGNAL_META,
+    43→  TIMEFRAMES,
+    44→  type CandleRow,
+    45→  type MarketSnapshot,
+    46→  type SignalDirection,
+    47→  type SignalRow,
+    48→  type StructuredSignal,
+    49→  type TickerRow,
+    50→  type Timeframe,
+    51→} from "@/lib/types";
+    52→
+    53→const SYMBOL_RE = /^[A-Z0-9]{5,15}$/;
+    54→
+    55→interface SnapshotEvent {
+    56→  snapshot: MarketSnapshot;
+    57→}
+    58→interface SignalEvent {
+    59→  signal: StructuredSignal;
+    60→  latencyMs: number;
+    61→  model: string;
+    62→}
+    63→interface ErrorEvent {
+    64→  message: string;
+    65→}
+    66→
+    67→export function SignalsPanel() {
+    68→  // ---- market state ----
+    69→  const [symbol, setSymbol] = React.useState("BTCUSDT");
+    70→  const [timeframe, setTimeframe] = React.useState<Timeframe>("15m");
+    71→  const [candles, setCandles] = React.useState<CandleRow[]>([]);
+    72→  const [ticker, setTicker] = React.useState<TickerRow | null>(null);
+    73→  const [quotes, setQuotes] = React.useState<Record<string, TickerRow>>({});
+    74→  const [chartLoading, setChartLoading] = React.useState(true);
+    75→  const [chartError, setChartError] = React.useState<string | null>(null);
+    76→  const [watchlist, setWatchlist] = React.useState<string[]>([...DEFAULT_SYMBOLS]);
+    77→  const [customSymbol, setCustomSymbol] = React.useState("");
+    78→
+    79→  // ---- analysis state ----
+    80→  const [model, setModel] = React.useState("edge0-35b");
+    81→  const [riskProfile, setRiskProfile] = React.useState("balanced");
+    82→  const [status, setStatus] = React.useState<SignalStatus>("idle");
+    83→  const [snapshot, setSnapshot] = React.useState<MarketSnapshot | null>(null);
+    84→  const [signal, setSignal] = React.useState<StructuredSignal | null>(null);
+    85→  const [rationale, setRationale] = React.useState("");
+    86→  const [streaming, setStreaming] = React.useState(false);
+    87→  const [analysisError, setAnalysisError] = React.useState<string | null>(null);
+    88→  const [latency, setLatency] = React.useState(0);
+    89→  const [analyzedKey, setAnalyzedKey] = React.useState("");
+    90→
+    91→  // ---- auto scan ----
+    92→  const [autoOn, setAutoOn] = React.useState(false);
+    93→  const [scanMinutes, setScanMinutes] = React.useState<number>(15);
+    94→  const [scanSymbols, setScanSymbols] = React.useState<string[]>(["BTCUSDT", "ETHUSDT", "SOLUSDT"]);
+    95→  const [nextScanAt, setNextScanAt] = React.useState<number | null>(null);
+    96→  const [nowTick, setNowTick] = React.useState(Date.now());
+    97→  const [scanProgress, setScanProgress] = React.useState<string | null>(null);
+    98→  const runningRef = React.useRef(false);
+    99→
+   100→  // ---- feed ----
+   101→  const [feed, setFeed] = React.useState<SignalRow[]>([]);
+   102→  const [feedLoading, setFeedLoading] = React.useState(true);
+   103→  const [feedFilter, setFeedFilter] = React.useState("all");
+   104→  const [expandedId, setExpandedId] = React.useState<string | null>(null);
+   105→
+   106→  const refreshFeed = React.useCallback(async () => {
+   107→    try {
+   108→      const res = await fetchJSON<{ ok: boolean; signals: SignalRow[] }>("/api/signals?limit=40");
+   109→      setFeed(res.signals);
+   110→    } catch {
+   111→      // feed is non-critical
+   112→    } finally {
+   113→      setFeedLoading(false);
+   114→    }
+   115→  }, []);
+   116→
+   117→  React.useEffect(() => {
+   118→    void refreshFeed();
+   119→  }, [refreshFeed]);
+   120→
+   121→  // restore auto-scan preferences
+   122→  React.useEffect(() => {
+   123→    try {
+   124→      const saved = localStorage.getItem("np.scan");
+   125→      if (!saved) return;
+   126→      const cfg = JSON.parse(saved) as { minutes?: number; symbols?: string[] };
+   127→      if (cfg.minutes && (SCAN_INTERVALS as readonly number[]).includes(cfg.minutes)) {
+   128→        setScanMinutes(cfg.minutes);
+   129→      }
+   130→      if (Array.isArray(cfg.symbols)) {
+   131→        setScanSymbols(cfg.symbols.filter((s) => SYMBOL_RE.test(s)).slice(0, 12));
+   132→      }
+   133→    } catch {
+   134→      // ignore malformed storage
+   135→    }
+   136→  }, []);
+   137→
+   138→  React.useEffect(() => {
+   139→    localStorage.setItem("np.scan", JSON.stringify({ minutes: scanMinutes, symbols: scanSymbols }));
+   140→  }, [scanMinutes, scanSymbols]);
+   141→
+   142→  // ---- chart data (30s refresh) ----
+   143→  const loadChart = React.useCallback(async () => {
+   144→    setChartLoading(true);
+   145→    setChartError(null);
+   146→    try {
+   147→      const res = await fetchJSON<{ ok: boolean; candles: CandleRow[]; ticker: TickerRow | null }>(
+   148→        `/api/market/klines?symbol=${encodeURIComponent(symbol)}&interval=${timeframe}&limit=150`,
+   149→      );
+   150→      setCandles(res.candles);
+   151→      setTicker(res.ticker);
+   152→    } catch (err) {
+   153→      setChartError(err instanceof Error ? err.message : "Failed to load chart data.");
+   154→    } finally {
+   155→      setChartLoading(false);
+   156→    }
+   157→  }, [symbol, timeframe]);
+   158→
+   159→  React.useEffect(() => {
+   160→    void loadChart();
+   161→    const iv = setInterval(() => {
+   162→      if (document.visibilityState === "visible") void loadChart();
+   163→    }, 30_000);
+   164→    return () => clearInterval(iv);
+   165→  }, [loadChart]);
+   166→
+   167→  // ---- watchlist quotes (12s refresh) ----
+   168→  const loadQuotes = React.useCallback(async () => {
+   169→    if (watchlist.length === 0) return;
+   170→    try {
+   171→      const res = await fetchJSON<{ ok: boolean; tickers: TickerRow[] }>(
+   172→        `/api/market/quote?symbols=${encodeURIComponent(watchlist.join(","))}`,
+   173→      );
+   174→      const map: Record<string, TickerRow> = {};
+   175→      for (const t of res.tickers) map[t.symbol] = t;
+   176→      setQuotes(map);
+   177→    } catch {
+   178→      // keep last quotes
+   179→    }
+   180→  }, [watchlist]);
+   181→
+   182→  React.useEffect(() => {
+   183→    void loadQuotes();
+   184→    const iv = setInterval(loadQuotes, 12_000);
+   185→    return () => clearInterval(iv);
+   186→  }, [loadQuotes]);
+   187→
+   188→  // ---- SSE analysis ----
+   189→  const analyzeSymbol = React.useCallback(
+   190→    async (sym: string, source: "manual" | "auto", silent: boolean): Promise<void> => {
+   191→      if (!silent) {
+   192→        setStatus("fetching");
+   193→        setSignal(null);
+   194→        setRationale("");
+   195→        setStreaming(false);
+   196→        setAnalysisError(null);
+   197→        setLatency(0);
+   198→      }
+   199→      let errored = false;
+   200→      let errorMessage = "";
+   201→      try {
+   202→        await postSSE(
+   203→          "/api/signals/analyze",
+   204→          { symbol: sym, interval: timeframe, model, riskProfile, source },
+   205→          {
+   206→            onEvent: (event, data) => {
+   207→              if (event === "snapshot") {
+   208→                if (!silent) {
+   209→                  setSnapshot((data as SnapshotEvent).snapshot);
+   210→                  setStatus("thinking");
+   211→                }
+   212→              } else if (event === "signal") {
+   213→                if (!silent) {
+   214→                  setSignal((data as SignalEvent).signal);
+   215→                  setLatency((data as SignalEvent).latencyMs);
+   216→                  setStatus("ready");
+   217→                  setAnalyzedKey(`${sym}|${timeframe}`);
+   218→                }
+   219→              } else if (event === "delta") {
+   220→                if (!silent) {
+   221→                  setStreaming(true);
+   222→                  setRationale((r) => r + (data as { t: string }).t);
+   223→                }
+   224→              } else if (event === "done") {
+   225→                if (!silent) setStreaming(false);
+   226→                void refreshFeed();
+   227→              } else if (event === "error") {
+   228→                errored = true;
+   229→                errorMessage = (data as ErrorEvent).message;
+   230→                if (!silent) {
+   231→                  setAnalysisError(errorMessage);
+   232→                  setStatus("error");
+   233→                  setStreaming(false);
+   234→                }
+   235→              }
+   236→            },
+   237→            onError: (err) => {
+   238→              errored = true;
+   239→              errorMessage = err.message;
+   240→              if (!silent) {
+   241→                setAnalysisError(err.message);
+   242→                setStatus("error");
+   243→              }
+   244→            },
+   245→          },
+   246→        );
+   247→      } catch (err) {
+   248→        errored = true;
+   249→        errorMessage = err instanceof Error ? err.message : "Request failed";
+   250→        if (!silent) {
+   251→          setAnalysisError(errorMessage);
+   252→          setStatus("error");
+   253→        }
+   254→      }
+   255→      if (errored) throw new Error(errorMessage || `${sym}: analysis failed`);
+   256→    },
+   257→    [timeframe, model, riskProfile, refreshFeed],
+   258→  );
+   259→
+   260→  const analyzeNow = React.useCallback(async () => {
+   261→    try {
+   262→      await analyzeSymbol(symbol, "manual", false);
+   263→    } catch {
+   264→      // error already reflected in the card
+   265→    }
+   266→  }, [analyzeSymbol, symbol]);
+   267→
+   268→  // ---- auto-scan loop ----
+   269→  const runScan = React.useCallback(async () => {
+   270→    if (runningRef.current) return;
+   271→    const list = scanSymbols.length > 0 ? scanSymbols : [symbol];
+   272→    runningRef.current = true;
+   273→    try {
+   274→      for (let i = 0; i < list.length; i++) {
+   275→        const sym = list[i];
+   276→        setScanProgress(`Analyzing ${sym} (${i + 1}/${list.length})…`);
+   277→        try {
+   278→          await analyzeSymbol(sym, "auto", true);
+   279→        } catch (err) {
+   280→          toast.error(`${sym} — ${err instanceof Error ? err.message : "scan failed"}`);
+   281→        }
+   282→      }
+   283→      toast.success(`Auto-scan complete — ${list.length} symbol${list.length === 1 ? "" : "s"} checked.`);
+   284→    } finally {
+   285→      runningRef.current = false;
+   286→      setScanProgress(null);
+   287→      setNextScanAt(Date.now() + scanMinutes * 60_000);
+   288→    }
+   289→  }, [scanSymbols, symbol, scanMinutes, analyzeSymbol]);
+   290→
+   291→  React.useEffect(() => {
+   292→    if (!autoOn) return;
+   293→    setNowTick(Date.now());
+   294→    const iv = setInterval(() => setNowTick(Date.now()), 1000);
+   295→    return () => clearInterval(iv);
+   296→  }, [autoOn]);
+   297→
+   298→  React.useEffect(() => {
+   299→    if (!autoOn) return;
+   300→    if (nextScanAt === null) {
+   301→      setNextScanAt(Date.now() + scanMinutes * 60_000);
+   302→      return;
+   303→    }
+   304→    if (nowTick >= nextScanAt && !runningRef.current) {
+   305→      void runScan();
+   306→    }
+   307→  }, [autoOn, nowTick, nextScanAt, scanMinutes, runScan]);
+   308→
+   309→  const toggleAuto = (on: boolean) => {
+   310→    setAutoOn(on);
+   311→    if (on) {
+   312→      setNextScanAt(Date.now() + scanMinutes * 60_000);
+   313→      toast.info(`Auto-scan armed — every ${scanMinutes} min across ${scanSymbols.length || 1} symbol(s).`);
+   314→    } else {
+   315→      setNextScanAt(null);
+   316→    }
+   317→  };
+   318→
+   319→  // ---- watchlist management ----
+   320→  const addSymbol = async () => {
+   321→    const s = customSymbol.trim().toUpperCase();
+   322→    if (!SYMBOL_RE.test(s)) {
+   323→      toast.error("Invalid symbol format — try e.g. LINKUSDT.");
+   324→      return;
+   325→    }
+   326→    if (watchlist.includes(s)) {
+   327→      toast.info(`${s} is already on the watchlist.`);
+   328→      setCustomSymbol("");
+   329→      return;
+   330→    }
+   331→    try {
+   332→      await fetchJSON(`/api/market/klines?symbol=${encodeURIComponent(s)}&interval=15m&limit=60`);
+   333→      setWatchlist((w) => [...w, s].slice(0, 12));
+   334→      setCustomSymbol("");
+   335→      toast.success(`${s} added to the watchlist.`);
+   336→    } catch (err) {
+   337→      toast.error(`${s} not found on Binance — ${err instanceof Error ? err.message : "check the ticker"}`);
+   338→    }
+   339→  };
+   340→
+   341→  const removeSymbol = (s: string) => {
+   342→    const next = watchlist.filter((x) => x !== s);
+   343→    setWatchlist(next);
+   344→    setScanSymbols((prev) => prev.filter((x) => x !== s));
+   345→    if (s === symbol && next.length > 0) setSymbol(next[0]);
+   346→  };
+   347→
+   348→  // ---- feed actions ----
+   349→  const deleteSignal = async (id: string) => {
+   350→    try {
+   351→      await fetchJSON(`/api/signals?id=${encodeURIComponent(id)}`, { method: "DELETE" });
+   352→      setFeed((f) => f.filter((x) => x.id !== id));
+   353→    } catch (err) {
+   354→      toast.error(err instanceof Error ? err.message : "Delete failed");
+   355→    }
+   356→  };
+   357→
+   358→  const clearAllSignals = async () => {
+   359→    if (!window.confirm("Delete all saved signals?")) return;
+   360→    try {
+   361→      await fetchJSON("/api/signals?all=1", { method: "DELETE" });
+   362→      setFeed([]);
+   363→      toast.success("Signal history cleared.");
+   364→    } catch (err) {
+   365→      toast.error(err instanceof Error ? err.message : "Clear failed");
+   366→    }
+   367→  };
+   368→
+   369→  // ---- derived ----
+   370→  const pending = status === "fetching" || status === "thinking";
+   371→  const chartLevels =
+   372→    signal && analyzedKey === `${symbol}|${timeframe}` && signal.direction !== "WAIT"
+   373→      ? {
+   374→          direction: signal.direction,
+   375→          entry: signal.entry,
+   376→          entryLow: signal.entryLow,
+   377→          entryHigh: signal.entryHigh,
+   378→          stopLoss: signal.stopLoss,
+   379→          takeProfit: signal.takeProfit,
+   380→        }
+   381→      : null;
+   382→
+   383→  const remainingMs = nextScanAt !== null ? Math.max(0, nextScanAt - nowTick) : null;
+   384→  const countdown =
+   385→    remainingMs !== null
+   386→      ? `${Math.floor(remainingMs / 60000)}:${Math.floor((remainingMs % 60000) / 1000)
+   387→          .toString()
+   388→          .padStart(2, "0")}`
+   389→      : null;
+   390→  const countdownPct =
+   391→    remainingMs !== null ? Math.max(0, Math.min(100, (1 - remainingMs / (scanMinutes * 60000)) * 100)) : 0;
+   392→
+   393→  const filteredFeed = feedFilter === "all" ? feed : feed.filter((s) => s.symbol === feedFilter);
+   394→  const counts = feed.reduce(
+   395→    (acc, s) => {
+   396→      acc[s.direction] = (acc[s.direction] ?? 0) + 1;
+   397→      return acc;
+   398→    },
+   399→    {} as Record<string, number>,
+   400→  );
+   401→  const snapMatches = snapshot && analyzedKey === `${symbol}|${timeframe}` ? snapshot : null;
+   402→
+   403→  return (
+   404→    <div className="space-y-5">
+   405→      {/* intro */}
+   406→      <div className="flex flex-wrap items-end justify-between gap-3">
+   407→        <div>
+   408→          <h2 className="flex items-center gap-2 text-lg font-bold">
+   409→            <Activity className="size-5 text-amber-500" aria-hidden />
+   410→            Trading Signal Terminal
+   411→          </h2>
+   412→          <p className="mt-0.5 text-sm text-muted-foreground">
+   413→            Live Binance spot bars → deterministic indicators → Edge0 verdict with entry, stop-loss &amp; take-profit.
+   414→          </p>
+   415→        </div>
+   416→        <Badge variant="outline" className="border-amber-300 bg-amber-50 text-[11px] text-amber-800 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-300">
+   417→          Educational study tool — not financial advice
+   418→        </Badge>
+   419→      </div>
+   420→
+   421→      {/* watchlist strip */}
+   422→      <div className="space-y-2">
+   423→        <div className="flex items-center justify-between">
+   424→          <p className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+   425→            <Radio className="size-3.5" aria-hidden /> Watchlist · live 24h
+   426→          </p>
+   427→          <div className="flex items-center gap-1.5">
+   428→            <Input
+   429→              value={customSymbol}
+   430→              onChange={(e) => setCustomSymbol(e.target.value.toUpperCase())}
+   431→              onKeyDown={(e) => {
+   432→                if (e.key === "Enter") void addSymbol();
+   433→              }}
+   434→              placeholder="Add e.g. LINKUSDT"
+   435→              className="h-8 w-40 text-xs"
+   436→              aria-label="Add symbol to watchlist"
+   437→            />
+   438→            <Button size="sm" variant="outline" className="h-8 gap-1 px-2" onClick={() => void addSymbol()}>
+   439→              <Plus className="size-3.5" aria-hidden /> Add
+   440→            </Button>
+   441→          </div>
+   442→        </div>
+   443→        <div className="custom-scrollbar flex gap-2 overflow-x-auto pb-1">
+   444→          {watchlist.map((sym) => {
+   445→            const q = quotes[sym];
+   446→            const active = sym === symbol;
+   447→            const up = (q?.priceChangePercent ?? 0) >= 0;
+   448→            return (
+   449→              <div key={sym} className="relative shrink-0">
+   450→                <button
+   451→                  type="button"
+   452→                  onClick={() => setSymbol(sym)}
+   453→                  className={`w-32 rounded-xl border p-2.5 text-left transition-colors ${
+   454→                    active
+   455→                      ? "border-amber-500 bg-amber-500/10"
+   456→                      : "border-border bg-card hover:border-amber-400/60 hover:bg-muted/50"
+   457→                  }`}
+   458→                  aria-pressed={active}
+   459→                  aria-label={`Show ${sym} chart`}
+   460→                >
+   461→                  <p className="flex items-center gap-1 text-xs font-bold">
+   462→                    {sym.replace("USDT", "")}
+   463→                    <span className="text-[9px] font-medium text-muted-foreground">/USDT</span>
+   464→                    {q && (
+   465→                      <span className={`ml-auto text-[10px] font-semibold ${up ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
+   466→                        {formatPct(q.priceChangePercent)}
+   467→                      </span>
+   468→                    )}
+   469→                  </p>
+   470→                  <p className="mt-1 font-mono text-sm font-semibold tabular-nums">
+   471→                    {q ? formatPrice(q.lastPrice) : <span className="text-muted-foreground">…</span>}
+   472→                  </p>
+   473→                  <p className="text-[10px] text-muted-foreground">
+   474→                    {q ? `Vol ${formatCompact(q.quoteVolume)}` : "loading"}
+   475→                  </p>
+   476→                </button>
+   477→                {watchlist.length > 1 && (
+   478→                  <button
+   479→                    type="button"
+   480→                    onClick={() => removeSymbol(sym)}
+   481→                    className="absolute -right-1.5 -top-1.5 hidden rounded-full border bg-background p-0.5 text-muted-foreground hover:text-rose-500 sm:block"
+   482→                    aria-label={`Remove ${sym} from watchlist`}
+   483→                  >
+   484→                    <X className="size-3" aria-hidden />
+   485→                  </button>
+   486→                )}
+   487→              </div>
+   488→            );
+   489→          })}
+   490→        </div>
+   491→      </div>
+   492→
+   493→      {/* chart + engine */}
+   494→      <div className="grid gap-4 lg:grid-cols-5">
+   495→        {/* chart card */}
+   496→        <Card className="lg:col-span-3">
+   497→          <CardHeader className="pb-2">
+   498→            <div className="flex flex-wrap items-center justify-between gap-2">
+   499→              <CardTitle className="flex items-center gap-2 text-base">
+   500→                <span className="font-mono">{symbol}</span>
+   501→                <span className="text-sm font-normal text-muted-foreground">· Binance spot</span>
+   502→                {ticker && (
+   503→                  <span className={`text-sm font-bold ${ticker.priceChangePercent >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
+   504→                    {formatPrice(ticker.lastPrice)}{" "}
+   505→                    <span className="text-xs font-semibold">{formatPct(ticker.priceChangePercent)}</span>
+   506→                  </span>
+   507→                )}
+   508→              </CardTitle>
+   509→              <div className="flex items-center gap-1">
+   510→                <div className="flex rounded-lg border p-0.5" role="group" aria-label="Chart timeframe">
+   511→                  {TIMEFRAMES.map((tf) => (
+   512→                    <button
+   513→                      key={tf}
+   514→                      type="button"
+   515→                      onClick={() => setTimeframe(tf)}
+   516→                      className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
+   517→                        timeframe === tf
+   518→                          ? "bg-zinc-900 text-amber-300 dark:bg-amber-500 dark:text-zinc-950"
+   519→                          : "text-muted-foreground hover:bg-muted"
+   520→                      }`}
+   521→                      aria-pressed={timeframe === tf}
+   522→                    >
+   523→                      {tf}
+   524→                    </button>
+   525→                  ))}
+   526→                </div>
+   527→                <Button
+   528→                  size="icon"
+   529→                  variant="ghost"
+   530→                  className="size-8"
+   531→                  onClick={() => void loadChart()}
+   532→                  aria-label="Refresh chart"
+   533→                >
+   534→                  <RefreshCw className={`size-4 ${chartLoading ? "animate-spin" : ""}`} aria-hidden />
+   535→                </Button>
+   536→              </div>
+   537→            </div>
+   538→          </CardHeader>
+   539→          <CardContent className="space-y-2">
+   540→            {chartError ? (
+   541→              <div className="flex h-64 flex-col items-center justify-center gap-2 text-center">
+   542→                <p className="text-sm font-medium text-rose-600 dark:text-rose-400">{chartError}</p>
+   543→                <Button size="sm" variant="outline" onClick={() => void loadChart()}>
+   544→                  Retry
+   545→                </Button>
+   546→              </div>
+   547→            ) : chartLoading && candles.length === 0 ? (
+   548→              <div className="space-y-2">
+   549→                <div className="h-72 animate-pulse rounded-lg bg-muted" />
+   550→                <div className="h-4 w-2/3 animate-pulse rounded bg-muted" />
+   551→              </div>
+   552→            ) : (
+   553→              <CandleChart candles={candles} interval={timeframe} levels={chartLevels} />
+   554→            )}
+   555→            <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
+   556→              {ticker && (
+   557→                <>
+   558→                  <span>24h high {formatPrice(ticker.highPrice)}</span>
+   559→                  <span>24h low {formatPrice(ticker.lowPrice)}</span>
+   560→                  <span>24h vol {formatCompact(ticker.quoteVolume)}</span>
+   561→                </>
+   562→              )}
+   563→              {snapMatches && (
+   564→                <>
+   565→                  <span className="text-amber-600 dark:text-amber-400">RSI {snapMatches.rsi14.toFixed(1)}</span>
+   566→                  <span>ATR {formatPrice(snapMatches.atr14)} ({snapMatches.atrPct.toFixed(2)}%)</span>
+   567→                  <span className="truncate">{snapMatches.trendLabel}</span>
+   568→                </>
+   569→              )}
+   570→              {chartLevels && <span className="font-semibold text-amber-600 dark:text-amber-400">dashed lines = last signal levels</span>}
+   571→            </div>
+   572→          </CardContent>
+   573→        </Card>
+   574→
+   575→        {/* engine card */}
+   576→        <Card className="lg:col-span-2">
+   577→          <CardHeader className="pb-2">
+   578→            <CardTitle className="flex items-center gap-2 text-base">
+   579→              <Crosshair className="size-4 text-amber-500" aria-hidden />
+   580→              Signal engine
+   581→            </CardTitle>
+   582→          </CardHeader>
+   583→          <CardContent className="space-y-3">
+   584→            <div className="grid grid-cols-2 gap-2">
+   585→              <div className="space-y-1">
+   586→                <p className="text-[11px] font-medium text-muted-foreground">Model</p>
+   587→                <Select value={model} onValueChange={setModel}>
+   588→                  <SelectTrigger className="h-8 text-xs" aria-label="Analysis model">
+   589→                    <SelectValue />
+   590→                  </SelectTrigger>
+   591→                  <SelectContent>
+   592→                    <SelectItem value="edge0-35b">edge0-35b · deep</SelectItem>
+   593→                    <SelectItem value="edge0-8b">edge0-8b · fast</SelectItem>
+   594→                  </SelectContent>
+   595→                </Select>
+   596→              </div>
+   597→              <div className="space-y-1">
+   598→                <p className="text-[11px] font-medium text-muted-foreground">Risk profile</p>
+   599→                <Select value={riskProfile} onValueChange={setRiskProfile}>
+   600→                  <SelectTrigger className="h-8 text-xs" aria-label="Risk profile">
+   601→                    <SelectValue />
+   602→                  </SelectTrigger>
+   603→                  <SelectContent>
+   604→                    {RISK_PROFILES.map((r) => (
+   605→                      <SelectItem key={r.value} value={r.value}>
+   606→                        {r.label}
+   607→                      </SelectItem>
+   608→                    ))}
+   609→                  </SelectContent>
+   610→                </Select>
+   611→              </div>
+   612→            </div>
+   613→            <p className="text-[11px] text-muted-foreground">
+   614→              {RISK_PROFILES.find((r) => r.value === riskProfile)?.hint}
+   615→            </p>
+   616→            <Button
+   617→              onClick={() => void analyzeNow()}
+   618→              disabled={pending}
+   619→              className="w-full gap-2 bg-zinc-900 font-semibold text-amber-300 hover:bg-zinc-800 dark:bg-amber-500 dark:text-zinc-950 dark:hover:bg-amber-400"
+   620→            >
+   621→              {pending ? (
+   622→                <>
+   623→                  <Loader2 className="size-4 animate-spin" aria-hidden />
+   624→                  {status === "fetching" ? "Fetching bars…" : "Model reasoning…"}
+   625→                </>
+   626→              ) : (
+   627→                <>
+   628→                  <Zap className="size-4" aria-hidden />
+   629→                  Analyze {symbol} now
+   630→                </>
+   631→              )}
+   632→            </Button>
+   633→            <div className="custom-scrollbar max-h-[540px] overflow-y-auto pr-1">
+   634→              <SignalCard
+   635→                status={status}
+   636→                symbol={symbol}
+   637→                interval={timeframe}
+   638→                signal={signal}
+   639→                snapshot={snapshot}
+   640→                rationale={rationale}
+   641→                streaming={streaming}
+   642→                error={analysisError}
+   643→                model={model}
+   644→                latencyMs={latency}
+   645→                source="manual"
+   646→              />
+   647→            </div>
+   648→          </CardContent>
+   649→        </Card>
+   650→      </div>
+   651→
+   652→      {/* auto scan */}
+   653→      <Card>
+   654→        <CardHeader className="pb-2">
+   655→          <div className="flex flex-wrap items-center justify-between gap-3">
+   656→            <CardTitle className="flex items-center gap-2 text-base">
+   657→              <Timer className="size-4 text-amber-500" aria-hidden />
+   658→              Auto-scan loop
+   659→              <span className="text-xs font-normal text-muted-foreground">
+   660→                periodically feeds fresh bars to the model
+   661→              </span>
+   662→            </CardTitle>
+   663→            <div className="flex items-center gap-2">
+   664→              <span className="text-xs text-muted-foreground">{autoOn ? "On" : "Off"}</span>
+   665→              <Switch checked={autoOn} onCheckedChange={toggleAuto} aria-label="Toggle auto-scan" />
+   666→            </div>
+   667→          </div>
+   668→        </CardHeader>
+   669→        <CardContent className="grid gap-4 md:grid-cols-2">
+   670→          <div className="space-y-3">
+   671→            <div className="flex flex-wrap items-center gap-2">
+   672→              <p className="text-xs font-medium text-muted-foreground">Every</p>
+   673→              <div className="flex rounded-lg border p-0.5" role="group" aria-label="Scan interval">
+   674→                {SCAN_INTERVALS.map((m) => (
+   675→                  <button
+   676→                    key={m}
+   677→                    type="button"
+   678→                    onClick={() => setScanMinutes(m)}
+   679→                    className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
+   680→                      scanMinutes === m
+   681→                        ? "bg-zinc-900 text-amber-300 dark:bg-amber-500 dark:text-zinc-950"
+   682→                        : "text-muted-foreground hover:bg-muted"
+   683→                    }`}
+   684→                    aria-pressed={scanMinutes === m}
+   685→                  >
+   686→                    {m}m
+   687→                  </button>
+   688→                ))}
+   689→              </div>
+   690→              <Button
+   691→                size="sm"
+   692→                variant="outline"
+   693→                className="h-8 gap-1.5"
+   694→                onClick={() => void runScan()}
+   695→                disabled={runningRef.current}
+   696→              >
+   697→                <Play className="size-3.5" aria-hidden /> Run now
+   698→              </Button>
+   699→            </div>
+   700→            <div>
+   701→              <p className="mb-1.5 text-xs font-medium text-muted-foreground">Symbols in the loop</p>
+   702→              <div className="flex flex-wrap gap-1.5">
+   703→                {watchlist.map((sym) => {
+   704→                  const on = scanSymbols.includes(sym);
+   705→                  return (
+   706→                    <button
+   707→                      key={sym}
+   708→                      type="button"
+   709→                      onClick={() =>
+   710→                        setScanSymbols((prev) => (on ? prev.filter((x) => x !== sym) : [...prev, sym]))
+   711→                      }
+   712→                      className={`rounded-full border px-2.5 py-1 font-mono text-[11px] font-semibold transition-colors ${
+   713→                        on
+   714→                          ? "border-amber-500 bg-amber-500/15 text-amber-700 dark:text-amber-400"
+   715→                          : "border-border text-muted-foreground hover:bg-muted"
+   716→                      }`}
+   717→                      aria-pressed={on}
+   718→                    >
+   719→                      {sym}
+   720→                    </button>
+   721→                  );
+   722→                })}
+   723→              </div>
+   724→            </div>
+   725→          </div>
+   726→          <div className="space-y-2 rounded-xl border bg-muted/30 p-3">
+   727→            {scanProgress ? (
+   728→              <p className="flex items-center gap-2 text-sm font-medium">
+   729→                <Loader2 className="size-4 animate-spin text-amber-500" aria-hidden />
+   730→                {scanProgress}
+   731→              </p>
+   732→            ) : autoOn && countdown ? (
+   733→              <>
+   734→                <div className="flex items-center justify-between text-sm">
+   735→                  <span className="text-muted-foreground">Next scan in</span>
+   736→                  <span className="font-mono text-lg font-bold tabular-nums">{countdown}</span>
+   737→                </div>
+   738→                <Progress value={countdownPct} className="h-1.5" aria-label="Time until next scan" />
+   739→              </>
+   740→            ) : (
+   741→              <p className="text-sm text-muted-foreground">
+   742→                Turn the loop on and the terminal will fetch fresh bars for each selected symbol every{" "}
+   743→                {scanMinutes} minutes, ask the model for BUY / SELL / WAIT verdicts with entry, SL and TP,
+   744→                and file every result into the feed below.
+   745→              </p>
+   746→            )}
+   747→            <p className="text-[11px] text-muted-foreground">
+   748→              Results persist to the database and appear in the feed even while you&apos;re on another tab.
+   749→            </p>
+   750→          </div>
+   751→        </CardContent>
+   752→      </Card>
+   753→
+   754→      {/* feed */}
+   755→      <Card>
+   756→        <CardHeader className="pb-2">
+   757→          <div className="flex flex-wrap items-center justify-between gap-2">
+   758→            <CardTitle className="flex items-center gap-2 text-base">
+   759→              Signal feed
+   760→              <span className="flex gap-1.5 text-xs font-normal">
+   761→                {counts.BUY ? (
+   762→                  <span className="rounded-full bg-emerald-100 px-2 py-0.5 font-semibold text-emerald-700 dark:bg-emerald-950 dark:text-emerald-400">
+   763→                    {counts.BUY} buy
+   764→                  </span>
+   765→                ) : null}
+   766→                {counts.SELL ? (
+   767→                  <span className="rounded-full bg-rose-100 px-2 py-0.5 font-semibold text-rose-700 dark:bg-rose-950 dark:text-rose-400">
+   768→                    {counts.SELL} sell
+   769→                  </span>
+   770→                ) : null}
+   771→                {counts.WAIT ? (
+   772→                  <span className="rounded-full bg-zinc-100 px-2 py-0.5 font-semibold text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400">
+   773→                    {counts.WAIT} wait
+   774→                  </span>
+   775→                ) : null}
+   776→              </span>
+   777→            </CardTitle>
+   778→            <div className="flex items-center gap-2">
+   779→              <Select value={feedFilter} onValueChange={setFeedFilter}>
+   780→                <SelectTrigger className="h-8 w-36 text-xs" aria-label="Filter feed by symbol">
+   781→                  <SelectValue />
+   782→                </SelectTrigger>
+   783→                <SelectContent>
+   784→                  <SelectItem value="all">All symbols</SelectItem>
+   785→                  {watchlist.map((s) => (
+   786→                    <SelectItem key={s} value={s}>
+   787→                      {s}
+   788→                    </SelectItem>
+   789→                  ))}
+   790→                </SelectContent>
+   791→              </Select>
+   792→              <Button size="sm" variant="ghost" className="h-8 gap-1 text-muted-foreground hover:text-rose-500" onClick={() => void clearAllSignals()}>
+   793→                <Trash2 className="size-3.5" aria-hidden /> Clear
+   794→              </Button>
+   795→            </div>
+   796→          </div>
+   797→        </CardHeader>
+   798→        <CardContent>
+   799→          {feedLoading ? (
+   800→            <div className="space-y-2">
+   801→              {[0, 1, 2].map((i) => (
+   802→                <div key={i} className="h-12 animate-pulse rounded-lg bg-muted" />
+   803→              ))}
+   804→            </div>
+   805→          ) : filteredFeed.length === 0 ? (
+   806→            <p className="py-8 text-center text-sm text-muted-foreground">
+   807→              No signals yet — analyze a symbol or arm the auto-scan loop.
+   808→            </p>
+   809→          ) : (
+   810→            <div className="custom-scrollbar max-h-96 space-y-1.5 overflow-y-auto pr-1">
+   811→              {filteredFeed.map((s) => {
+   812→                const meta = SIGNAL_META[s.direction];
+   813→                const open = expandedId === s.id;
+   814→                return (
+   815→                  <div key={s.id} className="rounded-lg border">
+   816→                    <button
+   817→                      type="button"
+   818→                      className="flex w-full flex-wrap items-center gap-2 p-2.5 text-left hover:bg-muted/40"
+   819→                      onClick={() => setExpandedId(open ? null : s.id)}
+   820→                      aria-expanded={open}
+   821→                    >
+   822→                      {open ? (
+   823→                        <ChevronDown className="size-4 shrink-0 text-muted-foreground" aria-hidden />
+   824→                      ) : (
+   825→                        <ChevronRight className="size-4 shrink-0 text-muted-foreground" aria-hidden />
+   826→                      )}
+   827→                      <span className={`inline-flex items-center rounded-md border px-2 py-0.5 text-[11px] font-bold ${meta.badge}`}>
+   828→                        {s.direction}
+   829→                      </span>
+   830→                      <span className="font-mono text-xs font-semibold">{s.symbol}</span>
+   831→                      <span className="text-[11px] text-muted-foreground">{s.interval}</span>
+   832→                      <span className="hidden font-mono text-[11px] text-muted-foreground sm:inline">
+   833→                        E {formatPrice(s.entry)} · SL {formatPrice(s.stopLoss)} · TP {formatPrice(s.takeProfit)}
+   834→                      </span>
+   835→                      <span className="ml-auto flex items-center gap-2 text-[11px] text-muted-foreground">
+   836→                        <span className="font-semibold text-amber-600 dark:text-amber-400">R:R {s.rrRatio.toFixed(2)}</span>
+   837→                        <span>{Math.round(s.confidence * 100)}%</span>
+   838→                        <span className="hidden sm:inline">{s.source === "auto" ? "auto" : "manual"}</span>
+   839→                        <span>{timeAgo(s.createdAt)}</span>
+   840→                      </span>
+   841→                    </button>
+   842→                    {open && (
+   843→                      <div className="space-y-2 border-t px-3 py-2.5">
+   844→                        <p className="text-xs leading-relaxed">{s.summary}</p>
+   845→                        {s.reasons.length > 0 && (
+   846→                          <ul className="space-y-1">
+   847→                            {s.reasons.map((r, i) => (
+   848→                              <li key={i} className="text-[11px] leading-relaxed text-muted-foreground">
+   849→                                · {r}
+   850→                              </li>
+   851→                            ))}
+   852→                          </ul>
+   853→                        )}
+   854→                        {s.rationale && <p className="text-[11px] italic leading-relaxed text-muted-foreground">{s.rationale}</p>}
+   855→                        <p className="text-[10px] text-muted-foreground">
+   856→                          {s.model} · {(s.latencyMs / 1000).toFixed(1)}s · at {formatPrice(s.price)}
+   857→                          {s.risks.length > 0 ? ` · risks: ${s.risks.join(" / ")}` : ""}
+   858→                        </p>
+   859→                        <div className="flex justify-end">
+   860→                          <Button
+   861→                            size="sm"
+   862→                            variant="ghost"
+   863→                            className="h-7 gap-1 text-[11px] text-muted-foreground hover:text-rose-500"
+   864→                            onClick={() => void deleteSignal(s.id)}
+   865→                          >
+   866→                            <Trash2 className="size-3" aria-hidden /> Delete
+   867→                          </Button>
+   868→                        </div>
+   869→                      </div>
+   870→                    )}
+   871→                  </div>
+   872→                );
+   873→              })}
+   874→            </div>
+   875→          )}
+   876→        </CardContent>
+   877→      </Card>
+   878→    </div>
+   879→  );
+   880→}
+   881→

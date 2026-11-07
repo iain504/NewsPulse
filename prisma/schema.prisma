@@ -88,6 +88,45 @@ model Signal {
   source      String @default("manual")
   createdAt   DateTime @default(now())
 
+  trade Trade?
+
   @@index([createdAt])
   @@index([symbol, createdAt])
+}
+
+// One simulated (paper) trade opened from a signal — P&L tracked to the cent
+model Trade {
+  id          String    @id @default(cuid())
+  signalId    String?   @unique
+  signal      Signal?   @relation(fields: [signalId], references: [id], onDelete: SetNull)
+  symbol      String
+  // BUY = long, SELL = short
+  direction   String
+  entryPrice  Float
+  stopLoss    Float
+  takeProfit  Float
+  // coins bought/sold (notional / entryPrice)
+  quantity    Float
+  // USDT position size at entry
+  notional    Float
+  // OPEN | CLOSED
+  status      String    @default("OPEN")
+  exitPrice   Float?
+  pnl         Float?
+  pnlPct      Float?
+  // TP | SL | MANUAL
+  exitReason  String?
+  openedAt    DateTime  @default(now())
+  closedAt    DateTime?
+
+  @@index([status])
+  @@index([symbol, openedAt])
+}
+
+// A symbol saved in the watchlist; `scan` marks it for the auto-scan loop
+model WatchItem {
+  id        String   @id @default(cuid())
+  symbol    String   @unique
+  scan      Boolean  @default(true)
+  createdAt DateTime @default(now())
 }

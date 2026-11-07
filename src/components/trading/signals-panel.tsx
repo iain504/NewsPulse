@@ -6,6 +6,7 @@ import {
   ChevronDown,
   ChevronRight,
   Crosshair,
+  Eye,
   Loader2,
   Play,
   Plus,
@@ -13,6 +14,7 @@ import {
   RefreshCw,
   Timer,
   Trash2,
+  Wallet,
   X,
   Zap,
 } from "lucide-react";
@@ -33,21 +35,25 @@ import {
 import { Switch } from "@/components/ui/switch";
 import { CandleChart } from "@/components/trading/candle-chart";
 import { SignalCard, type SignalStatus } from "@/components/trading/signal-card";
+import { TradesPanel } from "@/components/trading/trades-panel";
 import { fetchJSON, postSSE } from "@/lib/sse-client";
 import { formatCompact, formatPct, formatPrice, timeAgo } from "@/lib/format";
 import {
-  DEFAULT_SYMBOLS,
   RISK_PROFILES,
   SCAN_INTERVALS,
   SIGNAL_META,
   TIMEFRAMES,
   type CandleRow,
+  type ChartMarker,
   type MarketSnapshot,
-  type SignalDirection,
+  type OpenTradeRow,
   type SignalRow,
   type StructuredSignal,
   type TickerRow,
   type Timeframe,
+  type TradeRow,
+  type TradesResponse,
+  type WatchItemRow,
 } from "@/lib/types";
 
 const SYMBOL_RE = /^[A-Z0-9]{5,15}$/;
@@ -73,7 +79,7 @@ export function SignalsPanel() {
   const [quotes, setQuotes] = React.useState<Record<string, TickerRow>>({});
   const [chartLoading, setChartLoading] = React.useState(true);
   const [chartError, setChartError] = React.useState<string | null>(null);
-  const [watchlist, setWatchlist] = React.useState<string[]>([...DEFAULT_SYMBOLS]);
+  const [watchItems, setWatchItems] = React.useState<WatchItemRow[]>([]);
   const [customSymbol, setCustomSymbol] = React.useState("");
 
   // ---- analysis state ----
@@ -87,21 +93,33 @@ export function SignalsPanel() {
   const [analysisError, setAnalysisError] = React.useState<string | null>(null);
   const [latency, setLatency] = React.useState(0);
   const [analyzedKey, setAnalyzedKey] = React.useState("");
+  const [analyzedSymbol, setAnalyzedSymbol] = React.useState("");
+  const [signalId, setSignalId] = React.useState<string | null>(null);
 
   // ---- auto scan ----
   const [autoOn, setAutoOn] = React.useState(false);
   const [scanMinutes, setScanMinutes] = React.useState<number>(15);
-  const [scanSymbols, setScanSymbols] = React.useState<string[]>(["BTCUSDT", "ETHUSDT", "SOLUSDT"]);
   const [nextScanAt, setNextScanAt] = React.useState<number | null>(null);
   const [nowTick, setNowTick] = React.useState(Date.now());
   const [scanProgress, setScanProgress] = React.useState<string | null>(null);
   const runningRef = React.useRef(false);
+
+  const watchlist = React.useMemo(() => watchItems.map((i) => i.symbol), [watchItems]);
+  const scanSymbols = React.useMemo(() => watchItems.filter((i) => i.scan).map((i) => i.symbol), [watchItems]);
 
   // ---- feed ----
   const [feed, setFeed] = React.useState<SignalRow[]>([]);
   const [feedLoading, setFeedLoading] = React.useState(true);
   const [feedFilter, setFeedFilter] = React.useState("all");
   const [expandedId, setExpandedId] = React.useState<string | null>(null);
+
+  // ---- paper trading ----
+  const [trades, setTrades] = React.useState<TradesResponse | null>(null);
+  const [tradesLoading, setTradesLoading] = React.useState(true);
+  const [closingId, setClosingId] = React.useState<string | null>(null);
+  const [notional, setNotional] = React.useState(500);
+  const [simulatingId, setSimulatingId] = React.useState<string | null>(null);
+  const openIdsRef = React.useRef<Set<string>>(new Set());
 
   const refreshFeed = React.useCallback(async () => {
     try {
@@ -118,17 +136,14 @@ export function SignalsPanel() {
     void refreshFeed();
   }, [refreshFeed]);
 
-  // restore auto-scan preferences
+  // restore auto-scan preferences (interval only — symbols live in the DB watchlist)
   React.useEffect(() => {
     try {
       const saved = localStorage.getItem("np.scan");
       if (!saved) return;
-      const cfg = JSON.parse(saved) as { minutes?: number; symbols?: string[] };
+      const cfg = JSON.parse(saved) as { minutes?: number };
       if (cfg.minutes && (SCAN_INTERVALS as readonly number[]).includes(cfg.minutes)) {
         setScanMinutes(cfg.minutes);
-      }
-      if (Array.isArray(cfg.symbols)) {
-        setScanSymbols(cfg.symbols.filter((s) => SYMBOL_RE.test(s)).slice(0, 12));
       }
     } catch {
       // ignore malformed storage
@@ -136,8 +151,22 @@ export function SignalsPanel() {
   }, []);
 
   React.useEffect(() => {
-    localStorage.setItem("np.scan", JSON.stringify({ minutes: scanMinutes, symbols: scanSymbols }));
-  }, [scanMinutes, scanSymbols]);
+    localStorage.setItem("np.scan", JSON.stringify({ minutes: scanMinutes }));
+  }, [scanMinutes]);
+
+  // ---- DB-backed watchlist ----
+  const loadWatchlist = React.useCallback(async () => {
+    try {
+      const res = await fetchJSON<{ ok: boolean; items: WatchItemRow[] }>("/api/watchlist");
+      setWatchItems(res.items);
+    } catch {
+      // keep the current list on failure
+    }
+  }, []);
+
+  React.useEffect(() => {
+    void loadWatchlist();
+  }, [loadWatchlist]);
 
   // ---- chart data (30s refresh) ----
   const loadChart = React.useCallback(async () => {
@@ -185,6 +214,118 @@ export function SignalsPanel() {
     return () => clearInterval(iv);
   }, [loadQuotes]);
 
+  // ---- paper trades (10s polling also auto-closes SL/TP hits server-side) ----
+  const loadTrades = React.useCallback(async (announce = false) => {
+    try {
+      const res = await fetchJSON<TradesResponse>("/api/trades");
+      if (announce) {
+        const prev = openIdsRef.current;
+        for (const c of res.closed) {
+          if (!prev.has(c.id) || c.exitReason === "MANUAL") continue;
+          const pnl = c.pnl ?? 0;
+          const txt = `${pnl >= 0 ? "+" : "-"}${formatPrice(Math.abs(pnl))} USDT (${formatPct(c.pnlPct ?? 0)})`;
+          if (c.exitReason === "TP") {
+            toast.success(`${c.symbol} take-profit hit — realized ${txt}`);
+          } else if (c.exitReason === "SL") {
+            toast.error(`${c.symbol} stop-loss hit — realized ${txt}`);
+          }
+        }
+      }
+      openIdsRef.current = new Set(res.open.map((t) => t.id));
+      setTrades(res);
+    } catch {
+      // keep the last snapshot
+    } finally {
+      setTradesLoading(false);
+    }
+  }, []);
+
+  React.useEffect(() => {
+    void loadTrades();
+  }, [loadTrades]);
+
+  React.useEffect(() => {
+    const iv = setInterval(() => {
+      if (document.visibilityState === "visible") void loadTrades(true);
+    }, 10_000);
+    return () => clearInterval(iv);
+  }, [loadTrades]);
+
+  // ---- paper trade actions ----
+  const simulateTrade = React.useCallback(
+    async (sigId: string) => {
+      setSimulatingId(sigId);
+      try {
+        const res = await fetchJSON<{ ok: boolean; trade: OpenTradeRow }>("/api/trades", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ signalId: sigId, notional }),
+        });
+        toast.success(
+          `Paper ${res.trade.direction === "BUY" ? "long" : "short"} opened — ${res.trade.symbol} @ ${formatPrice(res.trade.entryPrice)} · ${res.trade.notional.toLocaleString()} USDT`,
+        );
+        await loadTrades();
+      } catch (err) {
+        toast.error(err instanceof Error ? err.message : "Failed to open the paper trade.");
+      } finally {
+        setSimulatingId(null);
+      }
+    },
+    [notional, loadTrades],
+  );
+
+  const closeTrade = React.useCallback(
+    async (id: string) => {
+      if (!window.confirm("Close this paper trade at the current market price?")) return;
+      setClosingId(id);
+      try {
+        const res = await fetchJSON<{ ok: boolean; trade: TradeRow }>("/api/trades/close", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ tradeId: id }),
+        });
+        const pnl = res.trade.pnl ?? 0;
+        const txt = `${pnl >= 0 ? "+" : "-"}${formatPrice(Math.abs(pnl))} USDT`;
+        if (pnl >= 0) toast.success(`${res.trade.symbol} closed manually — realized ${txt}`);
+        else toast.error(`${res.trade.symbol} closed manually — realized ${txt}`);
+        await loadTrades();
+      } catch (err) {
+        toast.error(err instanceof Error ? err.message : "Failed to close trade.");
+      } finally {
+        setClosingId(null);
+      }
+    },
+    [loadTrades],
+  );
+
+  const clearClosedTrades = React.useCallback(async () => {
+    if (!window.confirm("Clear the closed trade history? Open positions are kept.")) return;
+    try {
+      await fetchJSON("/api/trades?closed=1", { method: "DELETE" });
+      await loadTrades();
+      toast.success("Trade history cleared.");
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Clear failed");
+    }
+  }, [loadTrades]);
+
+  const resetAccount = React.useCallback(async () => {
+    if (
+      !window.confirm(
+        "Reset the paper account? ALL trades — open and closed — will be deleted and the balance returns to 10,000 USDT.",
+      )
+    )
+      return;
+    try {
+      await fetchJSON("/api/trades?all=1", { method: "DELETE" });
+      openIdsRef.current = new Set();
+      await loadTrades();
+      toast.success("Paper account reset.");
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Reset failed");
+    }
+  }, [loadTrades]);
+
   // ---- SSE analysis ----
   const analyzeSymbol = React.useCallback(
     async (sym: string, source: "manual" | "auto", silent: boolean): Promise<void> => {
@@ -195,6 +336,8 @@ export function SignalsPanel() {
         setStreaming(false);
         setAnalysisError(null);
         setLatency(0);
+        setSignalId(null);
+        setAnalyzedSymbol("");
       }
       let errored = false;
       let errorMessage = "";
@@ -210,11 +353,18 @@ export function SignalsPanel() {
                   setStatus("thinking");
                 }
               } else if (event === "signal") {
+                const sig = (data as SignalEvent).signal;
                 if (!silent) {
-                  setSignal((data as SignalEvent).signal);
+                  setSignal(sig);
                   setLatency((data as SignalEvent).latencyMs);
                   setStatus("ready");
                   setAnalyzedKey(`${sym}|${timeframe}`);
+                  setAnalyzedSymbol(sym);
+                } else if (sig.direction === "BUY" || sig.direction === "SELL") {
+                  const headline = `${sym} → ${sig.direction} @ ${formatPrice(sig.entry)}`;
+                  const detail = `confidence ${Math.round(sig.confidence * 100)}% · SL ${formatPrice(sig.stopLoss)} · TP ${formatPrice(sig.takeProfit)}`;
+                  if (sig.direction === "BUY") toast.success(headline, { description: detail });
+                  else toast.warning(headline, { description: detail });
                 }
               } else if (event === "delta") {
                 if (!silent) {
@@ -222,6 +372,8 @@ export function SignalsPanel() {
                   setRationale((r) => r + (data as { t: string }).t);
                 }
               } else if (event === "done") {
+                const doneData = data as { id?: string };
+                if (doneData?.id) setSignalId(doneData.id);
                 if (!silent) setStreaming(false);
                 void refreshFeed();
               } else if (event === "error") {
@@ -316,7 +468,7 @@ export function SignalsPanel() {
     }
   };
 
-  // ---- watchlist management ----
+  // ---- watchlist management (persisted in the database) ----
   const addSymbol = async () => {
     const s = customSymbol.trim().toUpperCase();
     if (!SYMBOL_RE.test(s)) {
@@ -329,20 +481,44 @@ export function SignalsPanel() {
       return;
     }
     try {
-      await fetchJSON(`/api/market/klines?symbol=${encodeURIComponent(s)}&interval=15m&limit=60`);
-      setWatchlist((w) => [...w, s].slice(0, 12));
+      const res = await fetchJSON<{ ok: boolean; item: WatchItemRow }>("/api/watchlist", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ symbol: s }),
+      });
+      setWatchItems((items) => [...items, res.item]);
       setCustomSymbol("");
       toast.success(`${s} added to the watchlist.`);
     } catch (err) {
-      toast.error(`${s} not found on Binance — ${err instanceof Error ? err.message : "check the ticker"}`);
+      toast.error(err instanceof Error ? err.message : `Could not add ${s}.`);
     }
   };
 
-  const removeSymbol = (s: string) => {
-    const next = watchlist.filter((x) => x !== s);
-    setWatchlist(next);
-    setScanSymbols((prev) => prev.filter((x) => x !== s));
-    if (s === symbol && next.length > 0) setSymbol(next[0]);
+  const removeSymbol = async (s: string) => {
+    try {
+      await fetchJSON(`/api/watchlist?symbol=${encodeURIComponent(s)}`, { method: "DELETE" });
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Remove failed");
+      return;
+    }
+    const next = watchItems.filter((x) => x.symbol !== s);
+    setWatchItems(next);
+    if (s === symbol && next.length > 0) setSymbol(next[0].symbol);
+  };
+
+  const toggleScan = async (item: WatchItemRow) => {
+    const next = !item.scan;
+    setWatchItems((items) => items.map((x) => (x.symbol === item.symbol ? { ...x, scan: next } : x)));
+    try {
+      await fetchJSON("/api/watchlist", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ symbol: item.symbol, scan: next }),
+      });
+    } catch (err) {
+      setWatchItems((items) => items.map((x) => (x.symbol === item.symbol ? { ...x, scan: item.scan } : x)));
+      toast.error(err instanceof Error ? err.message : "Could not update the scan flag");
+    }
   };
 
   // ---- feed actions ----
@@ -368,8 +544,19 @@ export function SignalsPanel() {
 
   // ---- derived ----
   const pending = status === "fetching" || status === "thinking";
-  const chartLevels =
-    signal && analyzedKey === `${symbol}|${timeframe}` && signal.direction !== "WAIT"
+  const cardSymbol = analyzedSymbol || symbol;
+  const openTradeForSymbol = trades?.open.find((t) => t.symbol === symbol) ?? null;
+  const openTradeForCard = trades?.open.find((t) => t.symbol === cardSymbol) ?? null;
+  const chartLevels = openTradeForSymbol
+    ? {
+        direction: openTradeForSymbol.direction,
+        entry: openTradeForSymbol.entryPrice,
+        entryLow: openTradeForSymbol.entryPrice,
+        entryHigh: openTradeForSymbol.entryPrice,
+        stopLoss: openTradeForSymbol.stopLoss,
+        takeProfit: openTradeForSymbol.takeProfit,
+      }
+    : signal && analyzedKey === `${symbol}|${timeframe}` && signal.direction !== "WAIT"
       ? {
           direction: signal.direction,
           entry: signal.entry,
@@ -379,6 +566,24 @@ export function SignalsPanel() {
           takeProfit: signal.takeProfit,
         }
       : null;
+
+  const chartMarkers = React.useMemo<ChartMarker[]>(() => {
+    if (candles.length === 0) return [];
+    const first = candles[0].openTime;
+    return feed
+      .filter(
+        (s): s is SignalRow & { direction: "BUY" | "SELL" } =>
+          s.symbol === symbol && (s.direction === "BUY" || s.direction === "SELL"),
+      )
+      .map((s) => ({
+        time: new Date(s.createdAt).getTime(),
+        direction: s.direction,
+        price: s.entry > 0 ? s.entry : s.price,
+        at: s.createdAt,
+      }))
+      .filter((m) => m.time >= first)
+      .sort((a, b) => a.time - b.time);
+  }, [feed, symbol, candles]);
 
   const remainingMs = nextScanAt !== null ? Math.max(0, nextScanAt - nowTick) : null;
   const countdown =
@@ -410,7 +615,8 @@ export function SignalsPanel() {
             Trading Signal Terminal
           </h2>
           <p className="mt-0.5 text-sm text-muted-foreground">
-            Live Binance spot bars → deterministic indicators → Edge0 verdict with entry, stop-loss &amp; take-profit.
+            Live Binance bars → Edge0 verdicts with entry, SL &amp; TP — plotted on the chart and ready to
+            simulate as paper trades with full P&amp;L tracking.
           </p>
         </div>
         <Badge variant="outline" className="border-amber-300 bg-amber-50 text-[11px] text-amber-800 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-300">
@@ -422,7 +628,7 @@ export function SignalsPanel() {
       <div className="space-y-2">
         <div className="flex items-center justify-between">
           <p className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-            <Radio className="size-3.5" aria-hidden /> Watchlist · live 24h
+            <Radio className="size-3.5" aria-hidden /> Watchlist · live 24h · persisted
           </p>
           <div className="flex items-center gap-1.5">
             <Input
@@ -441,12 +647,20 @@ export function SignalsPanel() {
           </div>
         </div>
         <div className="custom-scrollbar flex gap-2 overflow-x-auto pb-1">
-          {watchlist.map((sym) => {
+          {watchItems.map((item) => {
+            const sym = item.symbol;
             const q = quotes[sym];
             const active = sym === symbol;
             const up = (q?.priceChangePercent ?? 0) >= 0;
             return (
               <div key={sym} className="relative shrink-0">
+                {item.scan && (
+                  <span
+                    className="absolute -left-1 -top-1 z-10 size-2.5 rounded-full border border-background bg-amber-500"
+                    title="Included in the auto-scan loop"
+                    aria-hidden
+                  />
+                )}
                 <button
                   type="button"
                   onClick={() => setSymbol(sym)}
@@ -477,7 +691,7 @@ export function SignalsPanel() {
                 {watchlist.length > 1 && (
                   <button
                     type="button"
-                    onClick={() => removeSymbol(sym)}
+                    onClick={() => void removeSymbol(sym)}
                     className="absolute -right-1.5 -top-1.5 hidden rounded-full border bg-background p-0.5 text-muted-foreground hover:text-rose-500 sm:block"
                     aria-label={`Remove ${sym} from watchlist`}
                   >
@@ -499,6 +713,11 @@ export function SignalsPanel() {
               <CardTitle className="flex items-center gap-2 text-base">
                 <span className="font-mono">{symbol}</span>
                 <span className="text-sm font-normal text-muted-foreground">· Binance spot</span>
+                {openTradeForSymbol && (
+                  <span className="rounded-full border border-amber-300 bg-amber-50 px-2 py-0.5 text-[10px] font-bold text-amber-800 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-300">
+                    ● position open
+                  </span>
+                )}
                 {ticker && (
                   <span className={`text-sm font-bold ${ticker.priceChangePercent >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
                     {formatPrice(ticker.lastPrice)}{" "}
@@ -550,7 +769,7 @@ export function SignalsPanel() {
                 <div className="h-4 w-2/3 animate-pulse rounded bg-muted" />
               </div>
             ) : (
-              <CandleChart candles={candles} interval={timeframe} levels={chartLevels} />
+              <CandleChart candles={candles} interval={timeframe} levels={chartLevels} markers={chartMarkers} />
             )}
             <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
               {ticker && (
@@ -567,7 +786,11 @@ export function SignalsPanel() {
                   <span className="truncate">{snapMatches.trendLabel}</span>
                 </>
               )}
-              {chartLevels && <span className="font-semibold text-amber-600 dark:text-amber-400">dashed lines = last signal levels</span>}
+              {chartLevels && (
+                <span className="font-semibold text-amber-600 dark:text-amber-400">
+                  dashed lines = {openTradeForSymbol ? "open paper position levels" : "last signal levels"}
+                </span>
+              )}
             </div>
           </CardContent>
         </Card>
@@ -633,7 +856,7 @@ export function SignalsPanel() {
             <div className="custom-scrollbar max-h-[540px] overflow-y-auto pr-1">
               <SignalCard
                 status={status}
-                symbol={symbol}
+                symbol={cardSymbol}
                 interval={timeframe}
                 signal={signal}
                 snapshot={snapshot}
@@ -643,6 +866,16 @@ export function SignalsPanel() {
                 model={model}
                 latencyMs={latency}
                 source="manual"
+                canSimulate={!!signalId && signal !== null && signal.direction !== "WAIT" && !openTradeForCard}
+                simulating={!!signalId && simulatingId === signalId}
+                notional={notional}
+                onNotionalChange={setNotional}
+                onSimulate={signalId ? () => void simulateTrade(signalId) : undefined}
+                openTradeHint={
+                  openTradeForCard
+                    ? `Paper position already open for ${cardSymbol} — close it before simulating another.`
+                    : null
+                }
               />
             </div>
           </CardContent>
@@ -700,26 +933,22 @@ export function SignalsPanel() {
             <div>
               <p className="mb-1.5 text-xs font-medium text-muted-foreground">Symbols in the loop</p>
               <div className="flex flex-wrap gap-1.5">
-                {watchlist.map((sym) => {
-                  const on = scanSymbols.includes(sym);
-                  return (
-                    <button
-                      key={sym}
-                      type="button"
-                      onClick={() =>
-                        setScanSymbols((prev) => (on ? prev.filter((x) => x !== sym) : [...prev, sym]))
-                      }
-                      className={`rounded-full border px-2.5 py-1 font-mono text-[11px] font-semibold transition-colors ${
-                        on
-                          ? "border-amber-500 bg-amber-500/15 text-amber-700 dark:text-amber-400"
-                          : "border-border text-muted-foreground hover:bg-muted"
-                      }`}
-                      aria-pressed={on}
-                    >
-                      {sym}
-                    </button>
-                  );
-                })}
+                {watchItems.map((item) => (
+                  <button
+                    key={item.symbol}
+                    type="button"
+                    onClick={() => void toggleScan(item)}
+                    className={`rounded-full border px-2.5 py-1 font-mono text-[11px] font-semibold transition-colors ${
+                      item.scan
+                        ? "border-amber-500 bg-amber-500/15 text-amber-700 dark:text-amber-400"
+                        : "border-border text-muted-foreground hover:bg-muted"
+                    }`}
+                    aria-pressed={item.scan}
+                    aria-label={`${item.scan ? "Remove" : "Add"} ${item.symbol} ${item.scan ? "from" : "to"} the auto-scan loop`}
+                  >
+                    {item.symbol}
+                  </button>
+                ))}
               </div>
             </div>
           </div>
@@ -750,6 +979,35 @@ export function SignalsPanel() {
           </div>
         </CardContent>
       </Card>
+
+      {/* paper trading */}
+      <div className="space-y-2">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h3 className="flex items-center gap-2 text-sm font-bold">
+            <Wallet className="size-4 text-amber-500" aria-hidden />
+            Paper trading account
+            <span className="text-xs font-normal text-muted-foreground">
+              simulated fills at live Binance prices · P&amp;L stored in the database
+            </span>
+          </h3>
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-7 gap-1 text-muted-foreground hover:text-rose-500"
+            onClick={() => void resetAccount()}
+          >
+            <Trash2 className="size-3.5" aria-hidden /> Reset account
+          </Button>
+        </div>
+        <TradesPanel
+          trades={trades}
+          loading={tradesLoading}
+          onCloseTrade={(id) => void closeTrade(id)}
+          closingId={closingId}
+          onDeleteClosed={() => void clearClosedTrades()}
+          onSelectSymbol={(s) => setSymbol(s)}
+        />
+      </div>
 
       {/* feed */}
       <Card>
@@ -856,7 +1114,44 @@ export function SignalsPanel() {
                           {s.model} · {(s.latencyMs / 1000).toFixed(1)}s · at {formatPrice(s.price)}
                           {s.risks.length > 0 ? ` · risks: ${s.risks.join(" / ")}` : ""}
                         </p>
-                        <div className="flex justify-end">
+                        <div className="flex flex-wrap items-center justify-end gap-1.5">
+                          {s.symbol !== symbol && (
+                            <Button
+                              size="sm"
+                              variant="ghost"
+                              className="h-7 gap-1 text-[11px] text-muted-foreground hover:text-amber-600 dark:hover:text-amber-400"
+                              onClick={() => {
+                                setSymbol(s.symbol);
+                                setExpandedId(null);
+                              }}
+                              aria-label={`View ${s.symbol} chart`}
+                            >
+                              <Eye className="size-3" aria-hidden /> View chart
+                            </Button>
+                          )}
+                          {(s.direction === "BUY" || s.direction === "SELL") && (
+                            <Button
+                              size="sm"
+                              variant="ghost"
+                              className="h-7 gap-1 text-[11px] font-semibold text-emerald-700 hover:text-emerald-600 dark:text-emerald-500 dark:hover:text-emerald-400"
+                              disabled={
+                                simulatingId === s.id || !!trades?.open.some((t) => t.symbol === s.symbol)
+                              }
+                              title={
+                                trades?.open.some((t) => t.symbol === s.symbol)
+                                  ? "A paper position is already open for this symbol"
+                                  : `Simulate a ${s.direction === "BUY" ? "long" : "short"} trade of ${notional} USDT`
+                              }
+                              onClick={() => void simulateTrade(s.id)}
+                            >
+                              {simulatingId === s.id ? (
+                                <Loader2 className="size-3 animate-spin" aria-hidden />
+                              ) : (
+                                <Zap className="size-3" aria-hidden />
+                              )}
+                              Simulate
+                            </Button>
+                          )}
                           <Button
                             size="sm"
                             variant="ghost"

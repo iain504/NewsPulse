@@ -4,16 +4,32 @@ import * as React from "react";
 import {
   AlertTriangle,
   CheckCircle2,
+  Loader2,
   Minus,
   ShieldAlert,
   TrendingDown,
   TrendingUp,
+  Zap,
 } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { formatPrice } from "@/lib/format";
-import { SIGNAL_META, type MarketSnapshot, type SignalDirection, type StructuredSignal } from "@/lib/types";
+import {
+  NOTIONAL_OPTIONS,
+  SIGNAL_META,
+  type MarketSnapshot,
+  type SignalDirection,
+  type StructuredSignal,
+} from "@/lib/types";
 
 export type SignalStatus = "idle" | "fetching" | "thinking" | "ready" | "error";
 
@@ -29,6 +45,13 @@ interface SignalCardProps {
   model: string;
   latencyMs: number;
   source: string;
+  // paper-trading actions (optional)
+  canSimulate?: boolean;
+  simulating?: boolean;
+  notional?: number;
+  onNotionalChange?: (n: number) => void;
+  onSimulate?: () => void;
+  openTradeHint?: string | null;
 }
 
 function DirectionIcon({ direction, className }: { direction: SignalDirection; className?: string }) {
@@ -99,7 +122,25 @@ function PriceLadder({ signal, lastPrice }: { signal: StructuredSignal; lastPric
 }
 
 export function SignalCard(props: SignalCardProps) {
-  const { status, symbol, interval, signal, snapshot, rationale, streaming, error, model, latencyMs, source } = props;
+  const {
+    status,
+    symbol,
+    interval,
+    signal,
+    snapshot,
+    rationale,
+    streaming,
+    error,
+    model,
+    latencyMs,
+    source,
+    canSimulate,
+    simulating,
+    notional = 500,
+    onNotionalChange,
+    onSimulate,
+    openTradeHint,
+  } = props;
 
   if (status === "idle") {
     return (
@@ -213,6 +254,53 @@ export function SignalCard(props: SignalCardProps) {
                 </Badge>
                 <span className="text-muted-foreground">{signal.summary}</span>
               </div>
+              {onSimulate && (
+                <div className="flex flex-wrap items-center gap-2 border-t pt-3">
+                  {canSimulate ? (
+                    <>
+                      <Select
+                        value={String(notional)}
+                        onValueChange={(v) => onNotionalChange?.(Number(v))}
+                      >
+                        <SelectTrigger className="h-8 w-32 shrink-0 text-xs" aria-label="Position size in USDT">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {NOTIONAL_OPTIONS.map((n) => (
+                            <SelectItem key={n} value={String(n)}>
+                              {n.toLocaleString()} USDT
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                      <Button
+                        size="sm"
+                        disabled={simulating}
+                        onClick={onSimulate}
+                        className={`h-8 flex-1 gap-1.5 font-semibold text-white ${
+                          signal.direction === "BUY"
+                            ? "bg-emerald-600 hover:bg-emerald-500"
+                            : "bg-rose-600 hover:bg-rose-500"
+                        }`}
+                        aria-label={`Simulate a paper ${signal.direction === "BUY" ? "long" : "short"} trade of ${notional} USDT`}
+                      >
+                        {simulating ? (
+                          <Loader2 className="size-4 animate-spin" aria-hidden />
+                        ) : (
+                          <Zap className="size-4" aria-hidden />
+                        )}
+                        {simulating
+                          ? "Placing…"
+                          : `Simulate ${signal.direction === "BUY" ? "long" : "short"} · ${notional.toLocaleString()} USDT`}
+                      </Button>
+                    </>
+                  ) : (
+                    <p className="text-[11px] text-muted-foreground">
+                      {openTradeHint ?? "A paper position is already open for this symbol."}
+                    </p>
+                  )}
+                </div>
+              )}
             </>
           )}
         </div>

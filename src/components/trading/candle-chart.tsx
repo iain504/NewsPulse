@@ -4,7 +4,7 @@ import * as React from "react";
 
 import { emaSeries } from "@/lib/indicators";
 import { formatPrice, formatUtcTime } from "@/lib/format";
-import type { CandleRow } from "@/lib/types";
+import type { CandleRow, ChartMarker } from "@/lib/types";
 
 export interface ChartLevels {
   direction: "BUY" | "SELL" | "WAIT";
@@ -20,6 +20,8 @@ interface CandleChartProps {
   interval: string;
   levels?: ChartLevels | null;
   bars?: number;
+  /** Historical BUY/SELL signals plotted as arrows on their bars. */
+  markers?: ChartMarker[];
 }
 
 const UP = "#10b981";
@@ -33,10 +35,37 @@ const PAD_T = 14;
 const PAD_B = 46;
 const VOL_H = 60;
 
-export function CandleChart({ candles, interval, levels, bars = 64 }: CandleChartProps) {
+interface PlacedMarker extends ChartMarker {
+  idx: number;
+  ordinal: number;
+}
+
+export function CandleChart({ candles, interval, levels, bars = 64, markers }: CandleChartProps) {
   const shown = React.useMemo(() => candles.slice(-bars), [candles, bars]);
   const ema20 = React.useMemo(() => emaSeries(shown.map((c) => c.close), 20), [shown]);
   const ema50 = React.useMemo(() => emaSeries(shown.map((c) => c.close), 50), [shown]);
+
+  // Attach each signal marker to the bar that was open when it fired.
+  const placedMarkers = React.useMemo<PlacedMarker[]>(() => {
+    if (!markers || markers.length === 0 || shown.length < 2) return [];
+    const ordinals = new Map<number, number>();
+    const placed: PlacedMarker[] = [];
+    for (const m of markers) {
+      if (m.direction !== "BUY" && m.direction !== "SELL") continue;
+      let idx = -1;
+      for (let i = shown.length - 1; i >= 0; i--) {
+        if (shown[i].openTime <= m.time) {
+          idx = i;
+          break;
+        }
+      }
+      if (idx < 0) continue;
+      const ordinal = ordinals.get(idx) ?? 0;
+      ordinals.set(idx, ordinal + 1);
+      placed.push({ ...m, idx, ordinal });
+    }
+    return placed;
+  }, [markers, shown]);
 
   if (shown.length < 2) {
     return (
@@ -99,7 +128,7 @@ export function CandleChart({ candles, interval, levels, bars = 64 }: CandleChar
         viewBox={`0 0 ${VIEW_W} ${VIEW_H}`}
         className="h-auto w-full select-none"
         role="img"
-        aria-label={`${shown[0] ? "" : ""}Candlestick chart`}
+        aria-label={`${interval} candlestick chart with ${placedMarkers.length} signal marker${placedMarkers.length === 1 ? "" : "s"}`}
       >
         {/* horizontal grid + price labels */}
         {gridPrices.map((p) => (
@@ -196,6 +225,31 @@ export function CandleChart({ candles, interval, levels, bars = 64 }: CandleChar
                 opacity={up ? 0.9 : 1}
               />
             </g>
+          );
+        })}
+
+        {/* BUY / SELL signal markers */}
+        {placedMarkers.map((m, i) => {
+          const bar = shown[m.idx];
+          const cx = x(m.idx);
+          const isBuy = m.direction === "BUY";
+          const color = isBuy ? UP : DOWN;
+          const offset = m.ordinal * 13;
+          const tip = isBuy
+            ? y(bar.low) + 17 + offset
+            : y(bar.high) - 17 - offset;
+          const points = isBuy
+            ? `${cx},${tip - 9} ${cx - 5},${tip} ${cx + 5},${tip}`
+            : `${cx - 5},${tip} ${cx + 5},${tip} ${cx},${tip + 9}`;
+          return (
+            <polygon
+              key={`m-${m.at}-${i}`}
+              points={points}
+              fill={color}
+              opacity={0.95}
+            >
+              <title>{`${isBuy ? "BUY" : "SELL"} signal @ ${formatPrice(m.price)} · ${formatUtcTime(m.time, interval)}`}</title>
+            </polygon>
           );
         })}
 
@@ -296,6 +350,12 @@ export function CandleChart({ candles, interval, levels, bars = 64 }: CandleChar
           <line x1={PAD_L + 72} x2={PAD_L + 90} y1={priceTop + 4} y2={priceTop + 4} className="stroke-zinc-400" strokeWidth={2} strokeDasharray="4 3" />
           <text x={PAD_L + 95} y={priceTop + 7.5} className="fill-muted-foreground text-[10px]">
             EMA50
+          </text>
+          <text x={PAD_L + 146} y={priceTop + 8.5} fill={UP} className="text-[10px] font-bold">
+            ▲ BUY
+          </text>
+          <text x={PAD_L + 196} y={priceTop + 8.5} fill={DOWN} className="text-[10px] font-bold">
+            ▼ SELL
           </text>
         </g>
       </svg>
