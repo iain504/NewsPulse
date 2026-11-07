@@ -2,7 +2,7 @@ import { db } from "@/lib/db";
 import { fetchTicker24h } from "@/lib/binance";
 import { accountEquity } from "@/lib/trades";
 import { computeSizing, roundQty } from "@/lib/sizing";
-import type { SizingResponse } from "@/lib/types";
+import type { SizingPreview, SizingResponse } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 
@@ -69,7 +69,7 @@ export async function GET(req: Request) {
         }
       : null;
 
-    let fixed = null;
+    let fixed: SizingPreview | null = null;
     if (hasNotional) {
       const stopDistance = Math.abs(fillPrice - signal.stopLoss);
       if (stopDistance > 0) {

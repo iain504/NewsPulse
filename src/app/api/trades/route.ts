@@ -1,8 +1,5 @@
 import { db } from "@/lib/db";
-import { fetchTicker24h, ClientError } from "@/lib/binance";
-import { accountEquity, buildTradesResponse, toOpenTradeRow } from "@/lib/trades";
-import { computeSizing, roundQty } from "@/lib/sizing";
-import { roundPrice } from "@/lib/format";
+import { buildTradesResponse, openTradeFromSignal, toOpenTradeRow } from "@/lib/trades";
 
 export const dynamic = "force-dynamic";
 
@@ -27,6 +24,8 @@ export async function GET() {
  * POST /api/trades  { signalId, autoSize?, notional?, minConfidence?, source? }
  *
  * Opens a simulated trade from a saved signal, filling at the live market price.
+ * The heavy lifting lives in `openTradeFromSignal` (src/lib/trades.ts) so the
+ * background automation engine enforces exactly the same rules:
  *
  * Sizing modes:
  *  - autoSize: true  → confidence-driven risk engine: the position is sized so a
@@ -75,122 +74,17 @@ export async function POST(req: Request) {
   if (!signalId) return Response.json({ error: "signalId is required." }, { status: 400 });
 
   try {
-    const signal = await db.signal.findUnique({ where: { id: signalId } });
-    if (!signal) {
-      return Response.json({ error: "Signal not found — it may have been deleted." }, { status: 404 });
+    const res = await openTradeFromSignal({ signalId, autoSize, notional, minConfidence, source });
+    if (!res.ok) {
+      return Response.json({ error: res.error }, { status: res.status });
     }
-    if (signal.direction !== "BUY" && signal.direction !== "SELL") {
-      return Response.json(
-        { error: "This signal is a WAIT — there is no trade to simulate." },
-        { status: 400 },
-      );
-    }
-    if (!(signal.stopLoss > 0) || !(signal.takeProfit > 0)) {
-      return Response.json({ error: "Signal is missing stop-loss / take-profit levels." }, { status: 400 });
-    }
-    const isBuy = signal.direction === "BUY";
-    if (isBuy ? signal.stopLoss >= signal.takeProfit : signal.stopLoss <= signal.takeProfit) {
-      return Response.json({ error: "Signal has inverted SL/TP levels — analyze again." }, { status: 400 });
-    }
-
-    // Single-position mode — one trade at a side at a time (long OR short, any symbol).
-    const existing = await db.trade.findFirst({ where: { status: "OPEN" } });
-    if (existing) {
-      return Response.json(
-        {
-          error: `Single-position mode — ${existing.symbol} ${existing.direction === "BUY" ? "long" : "short"} is still open. Close it before opening another trade.`,
-          openSymbol: existing.symbol,
-        },
-        { status: 409 },
-      );
-    }
-
-    let price: number;
-    try {
-      price = (await fetchTicker24h(signal.symbol)).lastPrice;
-    } catch (err) {
-      const msg = err instanceof ClientError ? err.message : "Live price unavailable — try again.";
-      return Response.json({ error: msg }, { status: 502 });
-    }
-    if (!(price > 0)) {
-      return Response.json({ error: "Live price unavailable — try again." }, { status: 502 });
-    }
-
-    // Guard against fills that would instantly resolve the position.
-    const pastStop = isBuy ? price <= signal.stopLoss : price >= signal.stopLoss;
-    const pastTarget = isBuy ? price >= signal.takeProfit : price <= signal.takeProfit;
-    if (pastStop) {
-      return Response.json(
-        { error: `Market has moved past this signal's stop-loss (${roundPrice(signal.stopLoss)}) — analyze again for a fresh setup.` },
-        { status: 400 },
-      );
-    }
-    if (pastTarget) {
-      return Response.json(
-        { error: `Market is already beyond this signal's take-profit (${roundPrice(signal.takeProfit)}) — analyze again.` },
-        { status: 400 },
-      );
-    }
-
-    // ---- position sizing ---------------------------------------------------
-    const equity = await accountEquity();
-    let riskPct: number | null = null;
-    let riskAmount: number | null = null;
-    let positionSize: number;
-
-    if (autoSize) {
-      const sizing = computeSizing({
-        equity,
-        fillPrice: price,
-        stopLoss: signal.stopLoss,
-        confidence: signal.confidence,
-        minConfidence,
-      });
-      if (!sizing) {
-        return Response.json(
-          { error: "Could not size this trade — stop-loss too close to the live price." },
-          { status: 400 },
-        );
-      }
-      positionSize = sizing.notional;
-    } else {
-      positionSize = notional as number;
-    }
-
-    const quantity = Math.max(1e-8, roundQty(positionSize / price));
-
-    // Risk snapshot for every trade (fixed mode too) so history can display it.
-    const stopDistance = Math.abs(price - signal.stopLoss);
-    riskAmount = quantity * stopDistance;
-    riskPct = equity > 0 ? (riskAmount / equity) * 100 : null;
-
-    const trade = await db.trade.create({
-      data: {
-        signal: { connect: { id: signal.id } },
-        symbol: signal.symbol,
-        direction: signal.direction,
-        entryPrice: price,
-        stopLoss: signal.stopLoss,
-        takeProfit: signal.takeProfit,
-        quantity,
-        notional: positionSize,
-        confidence: signal.confidence,
-        riskPct,
-        riskAmount,
-        source,
-      },
-    });
-
-    const enriched = await db.trade.findUnique({
-      where: { id: trade.id },
-      include: { signal: true },
-    });
-    if (!enriched) {
-      return Response.json({ error: "Trade vanished right after creation." }, { status: 500 });
-    }
-
     return Response.json(
-      { ok: true, trade: toOpenTradeRow(enriched, price), riskPct, riskAmount },
+      {
+        ok: true,
+        trade: toOpenTradeRow(res.trade, res.trade.entryPrice),
+        riskPct: res.riskPct,
+        riskAmount: res.riskAmount,
+      },
       { status: 201 },
     );
   } catch (err) {

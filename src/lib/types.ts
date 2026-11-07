@@ -406,3 +406,38 @@ export const RISK_PROFILES: { value: string; label: string; hint: string }[] = [
 export const SCAN_INTERVALS = [5, 10, 15, 30] as const; // minutes
 
 export const DEFAULT_SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT"];
+
+// ---- automation engine (server-side, persisted in the DB) -----------------
+
+export interface EngineConfigState {
+  armed: boolean;
+  autoScan: boolean;
+  autoTrade: boolean;
+  minConfidence: number;
+  minRR: number;
+  scanMinutes: number;
+  interval: string;
+  riskProfile: string;
+  model: string;
+}
+
+export interface EngineStatusInfo {
+  config: EngineConfigState;
+  running: boolean;
+  nextScanAt: string | null;
+  lastTickAt: string | null;
+  lastTickMs: number | null;
+  openTrade: { symbol: string; direction: string; openedAt: string } | null;
+}
+
+export interface EngineEventRow {
+  id: string;
+  type: "scan" | "signal" | "open" | "skip" | "close" | "error" | "info" | (string & {});
+  symbol: string | null;
+  message: string;
+  createdAt: string;
+}
+
+export interface EngineResponse extends EngineStatusInfo {
+  ok: boolean;
+}

@@ -57,8 +57,11 @@ export async function POST(req: Request) {
       where: { id: updated.id },
       include: { signal: true },
     });
+    if (!enriched) {
+      return Response.json({ error: "Trade vanished right after closing." }, { status: 500 });
+    }
 
-    return Response.json({ ok: true, trade: toTradeRow(enriched ?? updated) });
+    return Response.json({ ok: true, trade: toTradeRow(enriched) });
   } catch (err) {
     return Response.json(
       { error: err instanceof Error ? err.message : "Failed to close trade." },

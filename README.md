@@ -27,6 +27,15 @@ Two AI models (`edge0-35b` for deep reasoning, `edge0-8b` for speed) are served 
 - **One trade at a time** — the engine refuses to stack positions; a new signal closes nothing, it is simply skipped while a trade is open
 - **Auto-trade gate** — automatic entries only fire when `confidence ≥ minConfidence` **and** `R:R ≥ minRR` (both configurable sliders, defaults **70%** and **1.8**); skipped signals are logged with the reason
 
+### 🤖 Always-on server engine
+The automation state (armed flags, thresholds, cadence) is **persisted in the database**, and the engine runs **inside the Next.js server process** (booted via `instrumentation.ts`) — so it keeps working with **no browser open**:
+
+1. every `scanMinutes` the server settles open trades against live prices (SL/TP), then scans every watchlist symbol flagged for scanning (Binance bars → indicators → LLM verdict → stored `Signal`)
+2. when auto-trade is armed, any scan signal clearing the confidence + R:R gates opens a paper trade automatically (single-position mode, confidence-driven sizing)
+3. every decision — scans, verdicts, skips, opens, closes, errors — lands in the `EngineEvent` log, which the UI replays, so everything that happened while you were away is auditable
+
+Arming/disarming and the sliders write through `POST /api/engine`; the UI polls the engine state, so the armed status survives reloads and is shared across devices.
+
 ### 🎯 Confidence-driven position sizing
 Position size is a function of the model's confidence, so the account risks *more* when the AI is sure and *less* when it isn't:
 
@@ -101,6 +110,9 @@ Models are expected to be named `edge0-35b` (deep reasoning) and `edge0-8b` (fas
 | `/api/market/quote` | GET | Live spot price for a symbol |
 | `/api/signals` | GET | Stored trade signals |
 | `/api/signals/analyze` | POST | Two-phase SSE trade-signal generation for a symbol/interval |
+| `/api/engine` | GET / POST | Automation engine state (armed flags, thresholds) / update it — persisted in the DB |
+| `/api/engine/events` | GET | Engine activity log (scans, verdicts, skips, opens, closes) |
+| `/api/engine/tick` | POST | Force one scan cycle right now ("Run now") |
 | `/api/trades` | GET / POST | Open trades (with live SL/TP evaluation) / open a new paper trade |
 | `/api/trades/close` | POST | Close a trade manually at market |
 | `/api/trades/sizing` | GET | Confidence-scaled position sizing preview for a signal |
@@ -116,6 +128,8 @@ Models are expected to be named `edge0-35b` (deep reasoning) and `edge0-8b` (fas
 | `Signal` | LLM trade signal — direction, entry zone, SL, TP, R:R, confidence, indicators snapshot, rationale |
 | `Trade` | Paper trade — linked signal, sizing snapshot (`confidence`, `riskPct`, `riskAmount`), status, exit reason, realised P&L |
 | `WatchItem` | Watchlist symbols flagged for auto-scan |
+| `EngineConfig` | Singleton — persisted automation engine state (armed, autoScan, autoTrade, thresholds, cadence) |
+| `EngineEvent` | Server engine activity log |
 
 ## 📁 Project structure
 
@@ -128,6 +142,7 @@ src/
 │   ├── news-sentiment/       # Live / Analyze / Dashboard / Study / History panels
 │   ├── trading/              # candle chart, signals panel, trades panel
 │   └── ui/                   # shadcn/ui primitives
+├── instrumentation.ts        # boots the automation engine at server start
 ├── lib/
 │   ├── edgezero.ts           # OpenAI-compatible client (SSE)
 │   ├── binance.ts            # klines + 24h tickers helpers
@@ -135,9 +150,11 @@ src/
 │   ├── signal.ts             # trading prompt + signal schema parsing
 │   ├── sizing.ts             # confidence-driven risk position sizing
 │   ├── trades.ts             # paper-trade engine (SL/TP evaluation, P&L)
+│   ├── engine.ts             # always-on automation engine (server singleton)
+│   ├── engine-events.ts      # engine activity log helpers
 │   ├── news.ts               # news search + article extraction
 │   └── sentiment.ts          # sentiment prompt + JSON normalisation
-└── prisma/schema.prisma      # Analysis · QuizRound · FollowedTopic · Signal · Trade · WatchItem
+└── prisma/schema.prisma      # Analysis · QuizRound · FollowedTopic · Signal · Trade · WatchItem · EngineConfig · EngineEvent
 ```
 
 ## 🧪 Scripts

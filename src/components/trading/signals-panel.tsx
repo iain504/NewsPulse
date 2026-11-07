@@ -47,6 +47,8 @@ import {
   TIMEFRAMES,
   type CandleRow,
   type ChartMarker,
+  type EngineEventRow,
+  type EngineResponse,
   type MarketSnapshot,
   type OpenTradeRow,
   type SizingMode,
@@ -61,12 +63,16 @@ import {
 
 const SYMBOL_RE = /^[A-Z0-9]{5,15}$/;
 
-interface AutoLogEntry {
-  id: number;
-  ts: number;
-  text: string;
-  kind: "opened" | "skipped" | "error";
-}
+/** Dot color per engine event type. */
+const EVENT_DOT: Record<string, string> = {
+  open: "bg-emerald-500",
+  close: "bg-emerald-500",
+  error: "bg-rose-500",
+  signal: "bg-amber-500",
+  skip: "bg-zinc-400",
+  scan: "bg-zinc-300 dark:bg-zinc-600",
+  info: "bg-zinc-300 dark:bg-zinc-600",
+};
 
 interface SnapshotEvent {
   snapshot: MarketSnapshot;
@@ -106,26 +112,20 @@ export function SignalsPanel() {
   const [analyzedSymbol, setAnalyzedSymbol] = React.useState("");
   const [signalId, setSignalId] = React.useState<string | null>(null);
 
-  // ---- auto scan ----
-  const [autoOn, setAutoOn] = React.useState(false);
-  const [scanMinutes, setScanMinutes] = React.useState<number>(15);
-  const [nextScanAt, setNextScanAt] = React.useState<number | null>(null);
+  // ---- automation engine (state lives on the SERVER, persisted in the DB) ----
+  const [engine, setEngine] = React.useState<EngineResponse | null>(null);
+  const [engineEvents, setEngineEvents] = React.useState<EngineEventRow[]>([]);
+  const [engineBusy, setEngineBusy] = React.useState(false);
   const [nowTick, setNowTick] = React.useState(Date.now());
-  const [scanProgress, setScanProgress] = React.useState<string | null>(null);
-  const [scanning, setScanning] = React.useState(false);
-  const runningRef = React.useRef(false);
 
-  // ---- auto trade (R:R + confidence gated) ----
-  const [autoTradeOn, setAutoTradeOn] = React.useState(false);
+  // local slider copies (synced from the persisted config on first load)
+  const [scanMinutes, setScanMinutes] = React.useState<number>(15);
   const [minConfidence, setMinConfidence] = React.useState(70);
   const [minRR, setMinRR] = React.useState(1.8);
-  const [autoLog, setAutoLog] = React.useState<AutoLogEntry[]>([]);
-  const autoLogIdRef = React.useRef(0);
-  const autoCfgRef = React.useRef({ autoTradeOn, minConfidence, minRR });
-  const autoSignalRef = React.useRef<StructuredSignal | null>(null);
+  const engineSyncedRef = React.useRef(false);
+  const patchDebounceRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const watchlist = React.useMemo(() => watchItems.map((i) => i.symbol), [watchItems]);
-  const scanSymbols = React.useMemo(() => watchItems.filter((i) => i.scan).map((i) => i.symbol), [watchItems]);
 
   // ---- feed ----
   const [feed, setFeed] = React.useState<SignalRow[]>([]);
@@ -157,48 +157,89 @@ export function SignalsPanel() {
     void refreshFeed();
   }, [refreshFeed]);
 
-  // restore auto-scan preferences (interval only — symbols live in the DB watchlist)
-  React.useEffect(() => {
+  // ---- engine status + activity log (polling keeps every device in sync) ----
+  const loadEngine = React.useCallback(async () => {
     try {
-      const saved = localStorage.getItem("np.scan");
-      if (!saved) return;
-      const cfg = JSON.parse(saved) as { minutes?: number };
-      if (cfg.minutes && (SCAN_INTERVALS as readonly number[]).includes(cfg.minutes)) {
-        setScanMinutes(cfg.minutes);
+      const res = await fetchJSON<EngineResponse>("/api/engine");
+      setEngine(res);
+      const nextMin = Math.round(res.config.minConfidence * 100);
+      if (!engineSyncedRef.current) {
+        engineSyncedRef.current = true;
+        setScanMinutes(res.config.scanMinutes);
+        setMinConfidence(nextMin);
+        setMinRR(res.config.minRR);
+      } else if (patchDebounceRef.current === null) {
+        // no local edit in flight — adopt the server values (keeps devices in sync)
+        setScanMinutes((m) => (m !== res.config.scanMinutes ? res.config.scanMinutes : m));
+        setMinConfidence((c) => (c !== nextMin ? nextMin : c));
+        setMinRR((r) => (r !== res.config.minRR ? res.config.minRR : r));
       }
     } catch {
-      // ignore malformed storage
+      // keep the last known state
+    }
+  }, []);
+
+  const loadEngineEvents = React.useCallback(async () => {
+    try {
+      const res = await fetchJSON<{ ok: boolean; events: EngineEventRow[] }>(
+        "/api/engine/events?limit=14",
+      );
+      setEngineEvents(res.events);
+    } catch {
+      // keep the last known log
     }
   }, []);
 
   React.useEffect(() => {
-    localStorage.setItem("np.scan", JSON.stringify({ minutes: scanMinutes }));
-  }, [scanMinutes]);
+    void loadEngine();
+    void loadEngineEvents();
+    const iv = setInterval(() => {
+      void loadEngine();
+      void loadEngineEvents();
+    }, 10_000);
+    return () => clearInterval(iv);
+  }, [loadEngine, loadEngineEvents]);
 
-  // restore auto-trade thresholds (the switch itself always starts off)
+  // 1-second ticker for the countdown while the engine is armed
   React.useEffect(() => {
-    try {
-      const saved = localStorage.getItem("np.autotrade");
-      if (!saved) return;
-      const cfg = JSON.parse(saved) as { minConfidence?: number; minRR?: number };
-      if (
-        typeof cfg.minConfidence === "number" &&
-        cfg.minConfidence >= 50 &&
-        cfg.minConfidence <= 95
-      ) {
-        setMinConfidence(Math.round(cfg.minConfidence));
-      }
-      if (typeof cfg.minRR === "number" && cfg.minRR >= 1 && cfg.minRR <= 3) {
-        setMinRR(cfg.minRR);
-      }
-    } catch {
-      // ignore malformed storage
-    }
-  }, []);
+    if (!engine?.config.armed) return;
+    setNowTick(Date.now());
+    const iv = setInterval(() => setNowTick(Date.now()), 1000);
+    return () => clearInterval(iv);
+  }, [engine?.config.armed]);
 
-  React.useEffect(() => {
-    localStorage.setItem("np.autotrade", JSON.stringify({ minConfidence, minRR }));
-  }, [minConfidence, minRR]);
+  /** Persist a config change on the server (armed flags, thresholds…). */
+  const updateEngine = React.useCallback(
+    async (patch: Record<string, unknown>) => {
+      setEngineBusy(true);
+      try {
+        const res = await fetchJSON<EngineResponse>("/api/engine", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(patch),
+        });
+        setEngine(res);
+        void loadEngineEvents();
+      } catch (err) {
+        toast.error(err instanceof Error ? err.message : "Engine update failed.");
+      } finally {
+        setEngineBusy(false);
+      }
+    },
+    [loadEngineEvents],
+  );
+
+  /** Slider / interval edits — batch rapid changes into one request. */
+  const queueEnginePatch = React.useCallback(
+    (patch: Record<string, unknown>) => {
+      if (patchDebounceRef.current) clearTimeout(patchDebounceRef.current);
+      patchDebounceRef.current = setTimeout(() => {
+        patchDebounceRef.current = null;
+        void updateEngine(patch);
+      }, 600);
+    },
+    [updateEngine],
+  );
 
   // restore position-sizing preference (mode + fixed amount)
   React.useEffect(() => {
@@ -218,12 +259,6 @@ export function SignalsPanel() {
   React.useEffect(() => {
     localStorage.setItem("np.sizing", JSON.stringify({ mode: sizingMode, fixed: notional }));
   }, [sizingMode, notional]);
-
-  // keep the auto-trade config available to long-lived scan closures without
-  // re-creating the callbacks mid-run
-  React.useEffect(() => {
-    autoCfgRef.current = { autoTradeOn, minConfidence, minRR };
-  }, [autoTradeOn, minConfidence, minRR]);
 
   // ---- DB-backed watchlist ----
   const loadWatchlist = React.useCallback(async () => {
@@ -322,85 +357,6 @@ export function SignalsPanel() {
     return () => clearInterval(iv);
   }, [loadTrades]);
 
-  // ---- auto-trade decision log ----
-  const pushAutoLog = React.useCallback((text: string, kind: AutoLogEntry["kind"]) => {
-    setAutoLog((log) => [{ id: ++autoLogIdRef.current, ts: Date.now(), text, kind }, ...log].slice(0, 12));
-  }, []);
-
-  /**
-   * Auto-trade gate: open a paper trade from a scan signal only when the
-   * signal passes the confidence AND reward:risk thresholds, and the account
-   * is flat (single-position mode). Every decision lands in the log.
-   */
-  const maybeAutoTrade = React.useCallback(
-    async (sigId: string, sig: StructuredSignal, sym: string) => {
-      const cfg = autoCfgRef.current;
-      if (!cfg.autoTradeOn) return;
-
-      const confPct = Math.round(sig.confidence * 100);
-      if (sig.direction !== "BUY" && sig.direction !== "SELL") {
-        pushAutoLog(`${sym} WAIT (${confPct}%) — no trade taken`, "skipped");
-        return;
-      }
-      const label = `${sym} ${sig.direction}`;
-      if (confPct < cfg.minConfidence) {
-        pushAutoLog(`${label} skipped — confidence ${confPct}% < ${cfg.minConfidence}%`, "skipped");
-        return;
-      }
-      if (sig.rrRatio < cfg.minRR) {
-        pushAutoLog(`${label} skipped — R:R ${sig.rrRatio.toFixed(2)} < ${cfg.minRR.toFixed(1)}`, "skipped");
-        return;
-      }
-
-      // single-position check against a fresh server snapshot (it also
-      // settles any position whose SL/TP was just touched)
-      try {
-        const fresh = await fetchJSON<TradesResponse>("/api/trades");
-        if (fresh.open.length > 0) {
-          pushAutoLog(
-            `${label} skipped — ${fresh.open[0].symbol} still open (one trade at a time)`,
-            "skipped",
-          );
-          return;
-        }
-      } catch {
-        // fall through — the server re-validates on POST anyway
-      }
-
-      try {
-        const res = await fetchJSON<{
-          ok: boolean;
-          trade: OpenTradeRow;
-          riskPct: number | null;
-          riskAmount: number | null;
-        }>("/api/trades", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            signalId: sigId,
-            autoSize: true,
-            minConfidence: cfg.minConfidence / 100,
-            source: "AUTO",
-          }),
-        });
-        const risk = res.riskAmount !== null ? `risk ${formatPrice(res.riskAmount)} USDT (${(res.riskPct ?? 0).toFixed(2)}%)` : "";
-        pushAutoLog(
-          `${label} opened @ ${formatPrice(res.trade.entryPrice)} · ${res.trade.notional.toLocaleString()} USDT${risk ? ` · ${risk}` : ""} · R:R ${sig.rrRatio.toFixed(2)} · ${confPct}%`,
-          "opened",
-        );
-        toast.success(`Auto-trade opened — ${label} @ ${formatPrice(res.trade.entryPrice)}`, {
-          description: `confidence ${confPct}% · R:R ${sig.rrRatio.toFixed(2)} · size ${res.trade.notional.toLocaleString()} USDT${risk ? ` · ${risk}` : ""}`,
-        });
-        await loadTrades();
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : "auto-trade failed";
-        pushAutoLog(`${label} failed — ${msg}`, "error");
-        toast.error(`Auto-trade rejected — ${msg}`);
-      }
-    },
-    [loadTrades, pushAutoLog],
-  );
-
   // ---- paper trade actions ----
   const simulateTrade = React.useCallback(
     async (sigId: string) => {
@@ -491,161 +447,115 @@ export function SignalsPanel() {
     }
   }, [loadTrades]);
 
-  // ---- SSE analysis ----
+  // ---- SSE analysis (manual only — automated scans run on the server) ----
   const analyzeSymbol = React.useCallback(
-    async (sym: string, source: "manual" | "auto", silent: boolean): Promise<void> => {
-      autoSignalRef.current = null;
-      if (!silent) {
-        setStatus("fetching");
-        setSignal(null);
-        setRationale("");
-        setStreaming(false);
-        setAnalysisError(null);
-        setLatency(0);
-        setSignalId(null);
-        setAnalyzedSymbol("");
-      }
+    async (sym: string): Promise<void> => {
+      setStatus("fetching");
+      setSignal(null);
+      setRationale("");
+      setStreaming(false);
+      setAnalysisError(null);
+      setLatency(0);
+      setSignalId(null);
+      setAnalyzedSymbol("");
       let errored = false;
       let errorMessage = "";
       try {
         await postSSE(
           "/api/signals/analyze",
-          { symbol: sym, interval: timeframe, model, riskProfile, source },
+          { symbol: sym, interval: timeframe, model, riskProfile, source: "manual" },
           {
             onEvent: (event, data) => {
               if (event === "snapshot") {
-                if (!silent) {
-                  setSnapshot((data as SnapshotEvent).snapshot);
-                  setStatus("thinking");
-                }
+                setSnapshot((data as SnapshotEvent).snapshot);
+                setStatus("thinking");
               } else if (event === "signal") {
                 const sig = (data as SignalEvent).signal;
-                if (!silent) {
-                  setSignal(sig);
-                  setLatency((data as SignalEvent).latencyMs);
-                  setStatus("ready");
-                  setAnalyzedKey(`${sym}|${timeframe}`);
-                  setAnalyzedSymbol(sym);
-                } else if (sig.direction === "BUY" || sig.direction === "SELL") {
-                  const headline = `${sym} → ${sig.direction} @ ${formatPrice(sig.entry)}`;
-                  const detail = `confidence ${Math.round(sig.confidence * 100)}% · SL ${formatPrice(sig.stopLoss)} · TP ${formatPrice(sig.takeProfit)}`;
-                  if (sig.direction === "BUY") toast.success(headline, { description: detail });
-                  else toast.warning(headline, { description: detail });
-                }
-                if (silent) autoSignalRef.current = sig;
+                setSignal(sig);
+                setLatency((data as SignalEvent).latencyMs);
+                setStatus("ready");
+                setAnalyzedKey(`${sym}|${timeframe}`);
+                setAnalyzedSymbol(sym);
               } else if (event === "delta") {
-                if (!silent) {
-                  setStreaming(true);
-                  setRationale((r) => r + (data as { t: string }).t);
-                }
+                setStreaming(true);
+                setRationale((r) => r + (data as { t: string }).t);
               } else if (event === "done") {
                 const doneData = data as { id?: string };
                 if (doneData?.id) setSignalId(doneData.id);
-                if (!silent) setStreaming(false);
+                setStreaming(false);
                 void refreshFeed();
-                const pendingSig = autoSignalRef.current;
-                autoSignalRef.current = null;
-                if (silent && doneData?.id && pendingSig) {
-                  void maybeAutoTrade(doneData.id, pendingSig, sym);
-                }
               } else if (event === "error") {
                 errored = true;
                 errorMessage = (data as ErrorEvent).message;
-                if (!silent) {
-                  setAnalysisError(errorMessage);
-                  setStatus("error");
-                  setStreaming(false);
-                }
+                setAnalysisError(errorMessage);
+                setStatus("error");
+                setStreaming(false);
               }
             },
             onError: (err) => {
               errored = true;
               errorMessage = err.message;
-              if (!silent) {
-                setAnalysisError(err.message);
-                setStatus("error");
-              }
+              setAnalysisError(err.message);
+              setStatus("error");
             },
           },
         );
       } catch (err) {
         errored = true;
         errorMessage = err instanceof Error ? err.message : "Request failed";
-        if (!silent) {
-          setAnalysisError(errorMessage);
-          setStatus("error");
-        }
+        setAnalysisError(errorMessage);
+        setStatus("error");
       }
       if (errored) throw new Error(errorMessage || `${sym}: analysis failed`);
     },
-    [timeframe, model, riskProfile, refreshFeed, maybeAutoTrade],
+    [timeframe, model, riskProfile, refreshFeed],
   );
 
   const analyzeNow = React.useCallback(async () => {
     try {
-      await analyzeSymbol(symbol, "manual", false);
+      await analyzeSymbol(symbol);
     } catch {
       // error already reflected in the card
     }
   }, [analyzeSymbol, symbol]);
 
-  // ---- auto-scan loop ----
+  // ---- server-side engine controls ----
   const runScan = React.useCallback(async () => {
-    if (runningRef.current) return;
-    const list = scanSymbols.length > 0 ? scanSymbols : [symbol];
-    runningRef.current = true;
-    setScanning(true);
+    setEngineBusy(true);
     try {
-      for (let i = 0; i < list.length; i++) {
-        const sym = list[i];
-        setScanProgress(`Analyzing ${sym} (${i + 1}/${list.length})…`);
-        try {
-          await analyzeSymbol(sym, "auto", true);
-        } catch (err) {
-          toast.error(`${sym} — ${err instanceof Error ? err.message : "scan failed"}`);
-        }
+      const res = await fetchJSON<{ ok: boolean; reason?: string }>("/api/engine/tick", {
+        method: "POST",
+      });
+      if (!res.ok) {
+        toast.info(res.reason ?? "The engine is busy — try again in a moment.");
+      } else {
+        toast.info("Scan started on the server — verdicts will land in the feed below.");
       }
-      toast.success(`Auto-scan complete — ${list.length} symbol${list.length === 1 ? "" : "s"} checked.`);
+      await loadEngine();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Could not start a scan.");
     } finally {
-      runningRef.current = false;
-      setScanning(false);
-      setScanProgress(null);
-      setNextScanAt(Date.now() + scanMinutes * 60_000);
+      setEngineBusy(false);
     }
-  }, [scanSymbols, symbol, scanMinutes, analyzeSymbol]);
-
-  React.useEffect(() => {
-    if (!autoOn) return;
-    setNowTick(Date.now());
-    const iv = setInterval(() => setNowTick(Date.now()), 1000);
-    return () => clearInterval(iv);
-  }, [autoOn]);
-
-  React.useEffect(() => {
-    if (!autoOn) return;
-    if (nextScanAt === null) {
-      setNextScanAt(Date.now() + scanMinutes * 60_000);
-      return;
-    }
-    if (nowTick >= nextScanAt && !runningRef.current) {
-      void runScan();
-    }
-  }, [autoOn, nowTick, nextScanAt, scanMinutes, runScan]);
+  }, [loadEngine]);
 
   const toggleAuto = (on: boolean) => {
-    setAutoOn(on);
+    void updateEngine({ armed: on });
     if (on) {
-      setNextScanAt(Date.now() + scanMinutes * 60_000);
-      toast.info(`Auto-scan armed — every ${scanMinutes} min across ${scanSymbols.length || 1} symbol(s).`);
+      toast.info(
+        `Engine armed — the server scans every ${scanMinutes} min. You can close this tab; it keeps running.`,
+      );
     } else {
-      setNextScanAt(null);
+      toast.info("Engine disarmed — server-side scanning and auto-trading stopped.");
     }
   };
 
   const toggleAutoTrade = (on: boolean) => {
-    setAutoTradeOn(on);
+    void updateEngine({ autoTrade: on });
     if (on) {
-      toast.info(`Auto-trade armed — confidence ≥ ${minConfidence}% · R:R ≥ ${minRR.toFixed(1)} · one trade at a time.`);
+      toast.info(
+        `Auto-trade armed — confidence ≥ ${minConfidence}% · R:R ≥ ${minRR.toFixed(1)} · one trade at a time.`,
+      );
     } else {
       toast.info("Auto-trade disarmed — new signals will not open trades.");
     }
@@ -767,7 +677,13 @@ export function SignalsPanel() {
       .sort((a, b) => a.time - b.time);
   }, [feed, symbol, candles]);
 
-  const remainingMs = nextScanAt !== null ? Math.max(0, nextScanAt - nowTick) : null;
+  // ---- engine-derived values ----
+  const armed = engine?.config.armed ?? false;
+  const autoTradeOn = engine?.config.autoTrade ?? false;
+  const scanning = engine?.running ?? false;
+
+  const remainingMs =
+    armed && engine?.nextScanAt ? Math.max(0, new Date(engine.nextScanAt).getTime() - nowTick) : null;
   const countdown =
     remainingMs !== null
       ? `${Math.floor(remainingMs / 60000)}:${Math.floor((remainingMs % 60000) / 1000)
@@ -1071,7 +987,7 @@ export function SignalsPanel() {
         </Card>
       </div>
 
-      {/* automation: scan loop + auto-trade engine */}
+      {/* automation: server-side scan loop + auto-trade engine */}
       <Card>
         <CardHeader className="pb-2">
           <div className="flex flex-wrap items-center justify-between gap-3">
@@ -1079,12 +995,17 @@ export function SignalsPanel() {
               <Timer className="size-4 text-amber-500" aria-hidden />
               Automation
               <span className="text-xs font-normal text-muted-foreground">
-                scan loop · auto-trade engine (R:R + confidence gated)
+                server-side engine · keeps running with the browser closed
               </span>
             </CardTitle>
             <div className="flex items-center gap-2">
-              <span className="text-xs text-muted-foreground">{autoOn ? "On" : "Off"}</span>
-              <Switch checked={autoOn} onCheckedChange={toggleAuto} aria-label="Toggle auto-scan" />
+              <span className="text-xs text-muted-foreground">{armed ? "On" : "Off"}</span>
+              <Switch
+                checked={armed}
+                disabled={engineBusy || !engine}
+                onCheckedChange={toggleAuto}
+                aria-label="Toggle the automation engine"
+              />
             </div>
           </div>
         </CardHeader>
@@ -1120,6 +1041,7 @@ export function SignalsPanel() {
               </div>
               <Switch
                 checked={autoTradeOn}
+                disabled={engineBusy || !engine}
                 onCheckedChange={toggleAutoTrade}
                 aria-label="Toggle auto-trade engine"
               />
@@ -1135,7 +1057,11 @@ export function SignalsPanel() {
                   min={50}
                   max={95}
                   step={1}
-                  onValueChange={(vals) => setMinConfidence(vals[0] ?? minConfidence)}
+                  onValueChange={(vals) => {
+                    const v = vals[0] ?? minConfidence;
+                    setMinConfidence(v);
+                    queueEnginePatch({ minConfidence: v / 100 });
+                  }}
                   aria-label="Minimum confidence for auto-trade"
                 />
               </div>
@@ -1149,7 +1075,11 @@ export function SignalsPanel() {
                   min={1}
                   max={3}
                   step={0.1}
-                  onValueChange={(vals) => setMinRR(vals[0] ?? minRR)}
+                  onValueChange={(vals) => {
+                    const v = vals[0] ?? minRR;
+                    setMinRR(v);
+                    queueEnginePatch({ minRR: v });
+                  }}
                   aria-label="Minimum reward-to-risk ratio for auto-trade"
                 />
               </div>
@@ -1171,7 +1101,10 @@ export function SignalsPanel() {
                   <button
                     key={m}
                     type="button"
-                    onClick={() => setScanMinutes(m)}
+                    onClick={() => {
+                      setScanMinutes(m);
+                      queueEnginePatch({ scanMinutes: m });
+                    }}
                     className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
                       scanMinutes === m
                         ? "bg-zinc-900 text-amber-300 dark:bg-amber-500 dark:text-zinc-950"
@@ -1188,7 +1121,7 @@ export function SignalsPanel() {
                 variant="outline"
                 className="h-8 gap-1.5"
                 onClick={() => void runScan()}
-                disabled={scanning}
+                disabled={engineBusy || scanning}
               >
                 {scanning ? (
                   <Loader2 className="size-3.5 animate-spin" aria-hidden />
@@ -1222,12 +1155,12 @@ export function SignalsPanel() {
           </div>
             <div className="space-y-3">
               <div className="space-y-2 rounded-xl border bg-muted/30 p-3">
-                {scanProgress ? (
+                {scanning ? (
                   <p className="flex items-center gap-2 text-sm font-medium">
                     <Loader2 className="size-4 animate-spin text-amber-500" aria-hidden />
-                    {scanProgress}
+                    Engine is scanning on the server…
                   </p>
-                ) : autoOn && countdown ? (
+                ) : armed && countdown ? (
                   <>
                     <div className="flex items-center justify-between text-sm">
                       <span className="text-muted-foreground">Next scan in</span>
@@ -1235,45 +1168,52 @@ export function SignalsPanel() {
                     </div>
                     <Progress value={countdownPct} className="h-1.5" aria-label="Time until next scan" />
                   </>
+                ) : armed ? (
+                  <p className="text-sm text-muted-foreground">
+                    Engine armed — the server is watching the market. Open trades are settled against live
+                    prices even while this page is closed.
+                  </p>
                 ) : (
                   <p className="text-sm text-muted-foreground">
-                    Turn the loop on and the terminal will fetch fresh bars for each selected symbol every{" "}
-                    {scanMinutes} minutes, ask the model for BUY / SELL / WAIT verdicts with entry, SL and TP,
-                    and file every result into the feed below.
+                    Arm the engine and the <span className="font-medium">server</span> will fetch fresh bars
+                    for each selected symbol every {scanMinutes} minutes, ask the model for BUY / SELL / WAIT
+                    verdicts with entry, SL and TP, and file every result into the feed below.
                   </p>
                 )}
                 <p className="text-[11px] text-muted-foreground">
-                  Results persist to the database and appear in the feed even while you&apos;re on another tab.
+                  Everything is persisted in the database — closing the browser does{" "}
+                  <span className="font-semibold">not</span> stop it.
                 </p>
               </div>
 
-              {autoLog.length > 0 && (
+              {engineEvents.length > 0 && (
                 <div className="rounded-xl border p-3">
                   <p className="mb-1.5 flex items-center gap-1.5 text-xs font-semibold">
-                    <Bot className="size-3.5 text-amber-500" aria-hidden /> Auto-trade log
+                    <Bot className="size-3.5 text-amber-500" aria-hidden /> Engine activity log
+                    <span className="font-normal text-muted-foreground">· stored server-side</span>
                   </p>
                   <div
                     className="custom-scrollbar max-h-44 space-y-1 overflow-y-auto pr-1"
                     aria-live="polite"
-                    aria-label="Auto-trade decisions"
+                    aria-label="Engine activity"
                   >
-                    {autoLog.map((e) => (
+                    {engineEvents.map((e) => (
                       <p key={e.id} className="flex items-start gap-1.5 text-[11px] leading-snug">
                         <span
                           className={`mt-1 size-1.5 shrink-0 rounded-full ${
-                            e.kind === "opened"
-                              ? "bg-emerald-500"
-                              : e.kind === "error"
-                                ? "bg-rose-500"
-                                : "bg-zinc-400"
+                            EVENT_DOT[e.type] ?? "bg-zinc-300 dark:bg-zinc-600"
                           }`}
                           aria-hidden
                         />
                         <span className="shrink-0 font-mono text-[10px] tabular-nums text-muted-foreground">
-                          {new Date(e.ts).toLocaleTimeString([], { hour12: false })}
+                          {new Date(e.createdAt).toLocaleTimeString([], { hour12: false })}
                         </span>
-                        <span className={e.kind === "opened" ? "font-medium" : "text-muted-foreground"}>
-                          {e.text}
+                        <span
+                          className={
+                            e.type === "open" || e.type === "close" ? "font-medium" : "text-muted-foreground"
+                          }
+                        >
+                          {e.message}
                         </span>
                       </p>
                     ))}

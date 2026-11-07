@@ -139,3 +139,40 @@ model WatchItem {
   scan      Boolean  @default(true)
   createdAt DateTime @default(now())
 }
+
+// Singleton row — persisted automation engine state, so the armed status and
+// thresholds survive server restarts and the browser being closed.
+model EngineConfig {
+  id            String   @id @default("singleton")
+  // master switch — when true the server-side loop keeps running on its own
+  armed         Boolean  @default(false)
+  // scan watchlist symbols every cycle
+  autoScan      Boolean  @default(true)
+  // open paper trades from scan signals that clear the gates
+  autoTrade     Boolean  @default(false)
+  // 0..1 — auto-trade confidence gate (floor of the risk-sizing curve)
+  minConfidence Float    @default(0.7)
+  // reward : risk gate for auto entries
+  minRR         Float    @default(1.8)
+  // minutes between scan cycles
+  scanMinutes   Int      @default(15)
+  // market data interval used for unattended scans
+  interval      String   @default("15m")
+  // risk profile passed to the model for unattended scans
+  riskProfile   String   @default("balanced")
+  // LLM used for unattended scans
+  model         String   @default("edge0-8b")
+  updatedAt     DateTime @updatedAt
+}
+
+// One log line of engine activity (scans, verdicts, skips, opens, closes, errors)
+model EngineEvent {
+  id        String   @id @default(cuid())
+  // scan | signal | open | skip | close | error | info
+  type      String
+  symbol    String?
+  message   String
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+}
