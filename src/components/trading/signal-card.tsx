@@ -296,7 +296,7 @@ export function SignalCard(props: SignalCardProps) {
                     </>
                   ) : (
                     <p className="text-[11px] text-muted-foreground">
-                      {openTradeHint ?? "A paper position is already open for this symbol."}
+                      {openTradeHint ?? "A paper position is already open — single-position mode allows one trade at a time."}
                     </p>
                   )}
                 </div>

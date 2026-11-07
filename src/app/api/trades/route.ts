@@ -23,11 +23,12 @@ export async function GET() {
 }
 
 /**
- * POST /api/trades  { signalId, notional }
+ * POST /api/trades  { signalId, notional, source? }
  * Opens a simulated trade from a saved signal, filling at the live market price.
+ * Single-position mode: only ONE trade may be open at a time (long or short).
  */
 export async function POST(req: Request) {
-  let body: { signalId?: unknown; notional?: unknown };
+  let body: { signalId?: unknown; notional?: unknown; source?: unknown };
   try {
     body = (await req.json()) as typeof body;
   } catch {
@@ -36,6 +37,7 @@ export async function POST(req: Request) {
 
   const signalId = typeof body.signalId === "string" ? body.signalId.trim() : "";
   const notional = typeof body.notional === "number" ? body.notional : Number(body.notional);
+  const source = body.source === "AUTO" ? "AUTO" : "MANUAL";
 
   if (!signalId) return Response.json({ error: "signalId is required." }, { status: 400 });
   if (!Number.isFinite(notional) || notional < 10 || notional > 1_000_000) {
@@ -61,12 +63,14 @@ export async function POST(req: Request) {
       return Response.json({ error: "Signal has inverted SL/TP levels — analyze again." }, { status: 400 });
     }
 
-    const existing = await db.trade.findFirst({
-      where: { symbol: signal.symbol, status: "OPEN" },
-    });
+    // Single-position mode — one trade at a side at a time (long OR short, any symbol).
+    const existing = await db.trade.findFirst({ where: { status: "OPEN" } });
     if (existing) {
       return Response.json(
-        { error: `You already have an open paper trade for ${signal.symbol} — close it first.` },
+        {
+          error: `Single-position mode — ${existing.symbol} ${existing.direction === "BUY" ? "long" : "short"} is still open. Close it before opening another trade.`,
+          openSymbol: existing.symbol,
+        },
         { status: 409 },
       );
     }
@@ -110,6 +114,7 @@ export async function POST(req: Request) {
         takeProfit: signal.takeProfit,
         quantity,
         notional,
+        source,
       },
     });
 

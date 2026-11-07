@@ -272,6 +272,8 @@ export interface TradeRow {
   quantity: number;
   notional: number;
   status: "OPEN" | "CLOSED";
+  /** MANUAL = simulated by the user · AUTO = opened by the R:R + confidence engine */
+  source: "MANUAL" | "AUTO";
   exitPrice: number | null;
   pnl: number | null;
   pnlPct: number | null;

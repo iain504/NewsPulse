@@ -1,0 +1,1176 @@
+     1→"use client";
+     2→
+     3→import * as React from "react";
+     4→import {
+     5→  Activity,
+     6→  ChevronDown,
+     7→  ChevronRight,
+     8→  Crosshair,
+     9→  Eye,
+    10→  Loader2,
+    11→  Play,
+    12→  Plus,
+    13→  Radio,
+    14→  RefreshCw,
+    15→  Timer,
+    16→  Trash2,
+    17→  Wallet,
+    18→  X,
+    19→  Zap,
+    20→} from "lucide-react";
+    21→import { toast } from "sonner";
+    22→
+    23→import { Badge } from "@/components/ui/badge";
+    24→import { Button } from "@/components/ui/button";
+    25→import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+    26→import { Input } from "@/components/ui/input";
+    27→import { Progress } from "@/components/ui/progress";
+    28→import {
+    29→  Select,
+    30→  SelectContent,
+    31→  SelectItem,
+    32→  SelectTrigger,
+    33→  SelectValue,
+    34→} from "@/components/ui/select";
+    35→import { Switch } from "@/components/ui/switch";
+    36→import { CandleChart } from "@/components/trading/candle-chart";
+    37→import { SignalCard, type SignalStatus } from "@/components/trading/signal-card";
+    38→import { TradesPanel } from "@/components/trading/trades-panel";
+    39→import { fetchJSON, postSSE } from "@/lib/sse-client";
+    40→import { formatCompact, formatPct, formatPrice, timeAgo } from "@/lib/format";
+    41→import {
+    42→  RISK_PROFILES,
+    43→  SCAN_INTERVALS,
+    44→  SIGNAL_META,
+    45→  TIMEFRAMES,
+    46→  type CandleRow,
+    47→  type ChartMarker,
+    48→  type MarketSnapshot,
+    49→  type OpenTradeRow,
+    50→  type SignalRow,
+    51→  type StructuredSignal,
+    52→  type TickerRow,
+    53→  type Timeframe,
+    54→  type TradeRow,
+    55→  type TradesResponse,
+    56→  type WatchItemRow,
+    57→} from "@/lib/types";
+    58→
+    59→const SYMBOL_RE = /^[A-Z0-9]{5,15}$/;
+    60→
+    61→interface SnapshotEvent {
+    62→  snapshot: MarketSnapshot;
+    63→}
+    64→interface SignalEvent {
+    65→  signal: StructuredSignal;
+    66→  latencyMs: number;
+    67→  model: string;
+    68→}
+    69→interface ErrorEvent {
+    70→  message: string;
+    71→}
+    72→
+    73→export function SignalsPanel() {
+    74→  // ---- market state ----
+    75→  const [symbol, setSymbol] = React.useState("BTCUSDT");
+    76→  const [timeframe, setTimeframe] = React.useState<Timeframe>("15m");
+    77→  const [candles, setCandles] = React.useState<CandleRow[]>([]);
+    78→  const [ticker, setTicker] = React.useState<TickerRow | null>(null);
+    79→  const [quotes, setQuotes] = React.useState<Record<string, TickerRow>>({});
+    80→  const [chartLoading, setChartLoading] = React.useState(true);
+    81→  const [chartError, setChartError] = React.useState<string | null>(null);
+    82→  const [watchItems, setWatchItems] = React.useState<WatchItemRow[]>([]);
+    83→  const [customSymbol, setCustomSymbol] = React.useState("");
+    84→
+    85→  // ---- analysis state ----
+    86→  const [model, setModel] = React.useState("edge0-35b");
+    87→  const [riskProfile, setRiskProfile] = React.useState("balanced");
+    88→  const [status, setStatus] = React.useState<SignalStatus>("idle");
+    89→  const [snapshot, setSnapshot] = React.useState<MarketSnapshot | null>(null);
+    90→  const [signal, setSignal] = React.useState<StructuredSignal | null>(null);
+    91→  const [rationale, setRationale] = React.useState("");
+    92→  const [streaming, setStreaming] = React.useState(false);
+    93→  const [analysisError, setAnalysisError] = React.useState<string | null>(null);
+    94→  const [latency, setLatency] = React.useState(0);
+    95→  const [analyzedKey, setAnalyzedKey] = React.useState("");
+    96→  const [analyzedSymbol, setAnalyzedSymbol] = React.useState("");
+    97→  const [signalId, setSignalId] = React.useState<string | null>(null);
+    98→
+    99→  // ---- auto scan ----
+   100→  const [autoOn, setAutoOn] = React.useState(false);
+   101→  const [scanMinutes, setScanMinutes] = React.useState<number>(15);
+   102→  const [nextScanAt, setNextScanAt] = React.useState<number | null>(null);
+   103→  const [nowTick, setNowTick] = React.useState(Date.now());
+   104→  const [scanProgress, setScanProgress] = React.useState<string | null>(null);
+   105→  const runningRef = React.useRef(false);
+   106→
+   107→  const watchlist = React.useMemo(() => watchItems.map((i) => i.symbol), [watchItems]);
+   108→  const scanSymbols = React.useMemo(() => watchItems.filter((i) => i.scan).map((i) => i.symbol), [watchItems]);
+   109→
+   110→  // ---- feed ----
+   111→  const [feed, setFeed] = React.useState<SignalRow[]>([]);
+   112→  const [feedLoading, setFeedLoading] = React.useState(true);
+   113→  const [feedFilter, setFeedFilter] = React.useState("all");
+   114→  const [expandedId, setExpandedId] = React.useState<string | null>(null);
+   115→
+   116→  // ---- paper trading ----
+   117→  const [trades, setTrades] = React.useState<TradesResponse | null>(null);
+   118→  const [tradesLoading, setTradesLoading] = React.useState(true);
+   119→  const [closingId, setClosingId] = React.useState<string | null>(null);
+   120→  const [notional, setNotional] = React.useState(500);
+   121→  const [simulatingId, setSimulatingId] = React.useState<string | null>(null);
+   122→  const openIdsRef = React.useRef<Set<string>>(new Set());
+   123→
+   124→  const refreshFeed = React.useCallback(async () => {
+   125→    try {
+   126→      const res = await fetchJSON<{ ok: boolean; signals: SignalRow[] }>("/api/signals?limit=40");
+   127→      setFeed(res.signals);
+   128→    } catch {
+   129→      // feed is non-critical
+   130→    } finally {
+   131→      setFeedLoading(false);
+   132→    }
+   133→  }, []);
+   134→
+   135→  React.useEffect(() => {
+   136→    void refreshFeed();
+   137→  }, [refreshFeed]);
+   138→
+   139→  // restore auto-scan preferences (interval only — symbols live in the DB watchlist)
+   140→  React.useEffect(() => {
+   141→    try {
+   142→      const saved = localStorage.getItem("np.scan");
+   143→      if (!saved) return;
+   144→      const cfg = JSON.parse(saved) as { minutes?: number };
+   145→      if (cfg.minutes && (SCAN_INTERVALS as readonly number[]).includes(cfg.minutes)) {
+   146→        setScanMinutes(cfg.minutes);
+   147→      }
+   148→    } catch {
+   149→      // ignore malformed storage
+   150→    }
+   151→  }, []);
+   152→
+   153→  React.useEffect(() => {
+   154→    localStorage.setItem("np.scan", JSON.stringify({ minutes: scanMinutes }));
+   155→  }, [scanMinutes]);
+   156→
+   157→  // ---- DB-backed watchlist ----
+   158→  const loadWatchlist = React.useCallback(async () => {
+   159→    try {
+   160→      const res = await fetchJSON<{ ok: boolean; items: WatchItemRow[] }>("/api/watchlist");
+   161→      setWatchItems(res.items);
+   162→    } catch {
+   163→      // keep the current list on failure
+   164→    }
+   165→  }, []);
+   166→
+   167→  React.useEffect(() => {
+   168→    void loadWatchlist();
+   169→  }, [loadWatchlist]);
+   170→
+   171→  // ---- chart data (30s refresh) ----
+   172→  const loadChart = React.useCallback(async () => {
+   173→    setChartLoading(true);
+   174→    setChartError(null);
+   175→    try {
+   176→      const res = await fetchJSON<{ ok: boolean; candles: CandleRow[]; ticker: TickerRow | null }>(
+   177→        `/api/market/klines?symbol=${encodeURIComponent(symbol)}&interval=${timeframe}&limit=150`,
+   178→      );
+   179→      setCandles(res.candles);
+   180→      setTicker(res.ticker);
+   181→    } catch (err) {
+   182→      setChartError(err instanceof Error ? err.message : "Failed to load chart data.");
+   183→    } finally {
+   184→      setChartLoading(false);
+   185→    }
+   186→  }, [symbol, timeframe]);
+   187→
+   188→  React.useEffect(() => {
+   189→    void loadChart();
+   190→    const iv = setInterval(() => {
+   191→      if (document.visibilityState === "visible") void loadChart();
+   192→    }, 30_000);
+   193→    return () => clearInterval(iv);
+   194→  }, [loadChart]);
+   195→
+   196→  // ---- watchlist quotes (12s refresh) ----
+   197→  const loadQuotes = React.useCallback(async () => {
+   198→    if (watchlist.length === 0) return;
+   199→    try {
+   200→      const res = await fetchJSON<{ ok: boolean; tickers: TickerRow[] }>(
+   201→        `/api/market/quote?symbols=${encodeURIComponent(watchlist.join(","))}`,
+   202→      );
+   203→      const map: Record<string, TickerRow> = {};
+   204→      for (const t of res.tickers) map[t.symbol] = t;
+   205→      setQuotes(map);
+   206→    } catch {
+   207→      // keep last quotes
+   208→    }
+   209→  }, [watchlist]);
+   210→
+   211→  React.useEffect(() => {
+   212→    void loadQuotes();
+   213→    const iv = setInterval(loadQuotes, 12_000);
+   214→    return () => clearInterval(iv);
+   215→  }, [loadQuotes]);
+   216→
+   217→  // ---- paper trades (10s polling also auto-closes SL/TP hits server-side) ----
+   218→  const loadTrades = React.useCallback(async (announce = false) => {
+   219→    try {
+   220→      const res = await fetchJSON<TradesResponse>("/api/trades");
+   221→      if (announce) {
+   222→        const prev = openIdsRef.current;
+   223→        for (const c of res.closed) {
+   224→          if (!prev.has(c.id) || c.exitReason === "MANUAL") continue;
+   225→          const pnl = c.pnl ?? 0;
+   226→          const txt = `${pnl >= 0 ? "+" : "-"}${formatPrice(Math.abs(pnl))} USDT (${formatPct(c.pnlPct ?? 0)})`;
+   227→          if (c.exitReason === "TP") {
+   228→            toast.success(`${c.symbol} take-profit hit — realized ${txt}`);
+   229→          } else if (c.exitReason === "SL") {
+   230→            toast.error(`${c.symbol} stop-loss hit — realized ${txt}`);
+   231→          }
+   232→        }
+   233→      }
+   234→      openIdsRef.current = new Set(res.open.map((t) => t.id));
+   235→      setTrades(res);
+   236→    } catch {
+   237→      // keep the last snapshot
+   238→    } finally {
+   239→      setTradesLoading(false);
+   240→    }
+   241→  }, []);
+   242→
+   243→  React.useEffect(() => {
+   244→    void loadTrades();
+   245→  }, [loadTrades]);
+   246→
+   247→  React.useEffect(() => {
+   248→    const iv = setInterval(() => {
+   249→      if (document.visibilityState === "visible") void loadTrades(true);
+   250→    }, 10_000);
+   251→    return () => clearInterval(iv);
+   252→  }, [loadTrades]);
+   253→
+   254→  // ---- paper trade actions ----
+   255→  const simulateTrade = React.useCallback(
+   256→    async (sigId: string) => {
+   257→      setSimulatingId(sigId);
+   258→      try {
+   259→        const res = await fetchJSON<{ ok: boolean; trade: OpenTradeRow }>("/api/trades", {
+   260→          method: "POST",
+   261→          headers: { "Content-Type": "application/json" },
+   262→          body: JSON.stringify({ signalId: sigId, notional }),
+   263→        });
+   264→        toast.success(
+   265→          `Paper ${res.trade.direction === "BUY" ? "long" : "short"} opened — ${res.trade.symbol} @ ${formatPrice(res.trade.entryPrice)} · ${res.trade.notional.toLocaleString()} USDT`,
+   266→        );
+   267→        await loadTrades();
+   268→      } catch (err) {
+   269→        toast.error(err instanceof Error ? err.message : "Failed to open the paper trade.");
+   270→      } finally {
+   271→        setSimulatingId(null);
+   272→      }
+   273→    },
+   274→    [notional, loadTrades],
+   275→  );
+   276→
+   277→  const closeTrade = React.useCallback(
+   278→    async (id: string) => {
+   279→      if (!window.confirm("Close this paper trade at the current market price?")) return;
+   280→      setClosingId(id);
+   281→      try {
+   282→        const res = await fetchJSON<{ ok: boolean; trade: TradeRow }>("/api/trades/close", {
+   283→          method: "POST",
+   284→          headers: { "Content-Type": "application/json" },
+   285→          body: JSON.stringify({ tradeId: id }),
+   286→        });
+   287→        const pnl = res.trade.pnl ?? 0;
+   288→        const txt = `${pnl >= 0 ? "+" : "-"}${formatPrice(Math.abs(pnl))} USDT`;
+   289→        if (pnl >= 0) toast.success(`${res.trade.symbol} closed manually — realized ${txt}`);
+   290→        else toast.error(`${res.trade.symbol} closed manually — realized ${txt}`);
+   291→        await loadTrades();
+   292→      } catch (err) {
+   293→        toast.error(err instanceof Error ? err.message : "Failed to close trade.");
+   294→      } finally {
+   295→        setClosingId(null);
+   296→      }
+   297→    },
+   298→    [loadTrades],
+   299→  );
+   300→
+   301→  const clearClosedTrades = React.useCallback(async () => {
+   302→    if (!window.confirm("Clear the closed trade history? Open positions are kept.")) return;
+   303→    try {
+   304→      await fetchJSON("/api/trades?closed=1", { method: "DELETE" });
+   305→      await loadTrades();
+   306→      toast.success("Trade history cleared.");
+   307→    } catch (err) {
+   308→      toast.error(err instanceof Error ? err.message : "Clear failed");
+   309→    }
+   310→  }, [loadTrades]);
+   311→
+   312→  const resetAccount = React.useCallback(async () => {
+   313→    if (
+   314→      !window.confirm(
+   315→        "Reset the paper account? ALL trades — open and closed — will be deleted and the balance returns to 10,000 USDT.",
+   316→      )
+   317→    )
+   318→      return;
+   319→    try {
+   320→      await fetchJSON("/api/trades?all=1", { method: "DELETE" });
+   321→      openIdsRef.current = new Set();
+   322→      await loadTrades();
+   323→      toast.success("Paper account reset.");
+   324→    } catch (err) {
+   325→      toast.error(err instanceof Error ? err.message : "Reset failed");
+   326→    }
+   327→  }, [loadTrades]);
+   328→
+   329→  // ---- SSE analysis ----
+   330→  const analyzeSymbol = React.useCallback(
+   331→    async (sym: string, source: "manual" | "auto", silent: boolean): Promise<void> => {
+   332→      if (!silent) {
+   333→        setStatus("fetching");
+   334→        setSignal(null);
+   335→        setRationale("");
+   336→        setStreaming(false);
+   337→        setAnalysisError(null);
+   338→        setLatency(0);
+   339→        setSignalId(null);
+   340→        setAnalyzedSymbol("");
+   341→      }
+   342→      let errored = false;
+   343→      let errorMessage = "";
+   344→      try {
+   345→        await postSSE(
+   346→          "/api/signals/analyze",
+   347→          { symbol: sym, interval: timeframe, model, riskProfile, source },
+   348→          {
+   349→            onEvent: (event, data) => {
+   350→              if (event === "snapshot") {
+   351→                if (!silent) {
+   352→                  setSnapshot((data as SnapshotEvent).snapshot);
+   353→                  setStatus("thinking");
+   354→                }
+   355→              } else if (event === "signal") {
+   356→                const sig = (data as SignalEvent).signal;
+   357→                if (!silent) {
+   358→                  setSignal(sig);
+   359→                  setLatency((data as SignalEvent).latencyMs);
+   360→                  setStatus("ready");
+   361→                  setAnalyzedKey(`${sym}|${timeframe}`);
+   362→                  setAnalyzedSymbol(sym);
+   363→                } else if (sig.direction === "BUY" || sig.direction === "SELL") {
+   364→                  const headline = `${sym} → ${sig.direction} @ ${formatPrice(sig.entry)}`;
+   365→                  const detail = `confidence ${Math.round(sig.confidence * 100)}% · SL ${formatPrice(sig.stopLoss)} · TP ${formatPrice(sig.takeProfit)}`;
+   366→                  if (sig.direction === "BUY") toast.success(headline, { description: detail });
+   367→                  else toast.warning(headline, { description: detail });
+   368→                }
+   369→              } else if (event === "delta") {
+   370→                if (!silent) {
+   371→                  setStreaming(true);
+   372→                  setRationale((r) => r + (data as { t: string }).t);
+   373→                }
+   374→              } else if (event === "done") {
+   375→                const doneData = data as { id?: string };
+   376→                if (doneData?.id) setSignalId(doneData.id);
+   377→                if (!silent) setStreaming(false);
+   378→                void refreshFeed();
+   379→              } else if (event === "error") {
+   380→                errored = true;
+   381→                errorMessage = (data as ErrorEvent).message;
+   382→                if (!silent) {
+   383→                  setAnalysisError(errorMessage);
+   384→                  setStatus("error");
+   385→                  setStreaming(false);
+   386→                }
+   387→              }
+   388→            },
+   389→            onError: (err) => {
+   390→              errored = true;
+   391→              errorMessage = err.message;
+   392→              if (!silent) {
+   393→                setAnalysisError(err.message);
+   394→                setStatus("error");
+   395→              }
+   396→            },
+   397→          },
+   398→        );
+   399→      } catch (err) {
+   400→        errored = true;
+   401→        errorMessage = err instanceof Error ? err.message : "Request failed";
+   402→        if (!silent) {
+   403→          setAnalysisError(errorMessage);
+   404→          setStatus("error");
+   405→        }
+   406→      }
+   407→      if (errored) throw new Error(errorMessage || `${sym}: analysis failed`);
+   408→    },
+   409→    [timeframe, model, riskProfile, refreshFeed],
+   410→  );
+   411→
+   412→  const analyzeNow = React.useCallback(async () => {
+   413→    try {
+   414→      await analyzeSymbol(symbol, "manual", false);
+   415→    } catch {
+   416→      // error already reflected in the card
+   417→    }
+   418→  }, [analyzeSymbol, symbol]);
+   419→
+   420→  // ---- auto-scan loop ----
+   421→  const runScan = React.useCallback(async () => {
+   422→    if (runningRef.current) return;
+   423→    const list = scanSymbols.length > 0 ? scanSymbols : [symbol];
+   424→    runningRef.current = true;
+   425→    try {
+   426→      for (let i = 0; i < list.length; i++) {
+   427→        const sym = list[i];
+   428→        setScanProgress(`Analyzing ${sym} (${i + 1}/${list.length})…`);
+   429→        try {
+   430→          await analyzeSymbol(sym, "auto", true);
+   431→        } catch (err) {
+   432→          toast.error(`${sym} — ${err instanceof Error ? err.message : "scan failed"}`);
+   433→        }
+   434→      }
+   435→      toast.success(`Auto-scan complete — ${list.length} symbol${list.length === 1 ? "" : "s"} checked.`);
+   436→    } finally {
+   437→      runningRef.current = false;
+   438→      setScanProgress(null);
+   439→      setNextScanAt(Date.now() + scanMinutes * 60_000);
+   440→    }
+   441→  }, [scanSymbols, symbol, scanMinutes, analyzeSymbol]);
+   442→
+   443→  React.useEffect(() => {
+   444→    if (!autoOn) return;
+   445→    setNowTick(Date.now());
+   446→    const iv = setInterval(() => setNowTick(Date.now()), 1000);
+   447→    return () => clearInterval(iv);
+   448→  }, [autoOn]);
+   449→
+   450→  React.useEffect(() => {
+   451→    if (!autoOn) return;
+   452→    if (nextScanAt === null) {
+   453→      setNextScanAt(Date.now() + scanMinutes * 60_000);
+   454→      return;
+   455→    }
+   456→    if (nowTick >= nextScanAt && !runningRef.current) {
+   457→      void runScan();
+   458→    }
+   459→  }, [autoOn, nowTick, nextScanAt, scanMinutes, runScan]);
+   460→
+   461→  const toggleAuto = (on: boolean) => {
+   462→    setAutoOn(on);
+   463→    if (on) {
+   464→      setNextScanAt(Date.now() + scanMinutes * 60_000);
+   465→      toast.info(`Auto-scan armed — every ${scanMinutes} min across ${scanSymbols.length || 1} symbol(s).`);
+   466→    } else {
+   467→      setNextScanAt(null);
+   468→    }
+   469→  };
+   470→
+   471→  // ---- watchlist management (persisted in the database) ----
+   472→  const addSymbol = async () => {
+   473→    const s = customSymbol.trim().toUpperCase();
+   474→    if (!SYMBOL_RE.test(s)) {
+   475→      toast.error("Invalid symbol format — try e.g. LINKUSDT.");
+   476→      return;
+   477→    }
+   478→    if (watchlist.includes(s)) {
+   479→      toast.info(`${s} is already on the watchlist.`);
+   480→      setCustomSymbol("");
+   481→      return;
+   482→    }
+   483→    try {
+   484→      const res = await fetchJSON<{ ok: boolean; item: WatchItemRow }>("/api/watchlist", {
+   485→        method: "POST",
+   486→        headers: { "Content-Type": "application/json" },
+   487→        body: JSON.stringify({ symbol: s }),
+   488→      });
+   489→      setWatchItems((items) => [...items, res.item]);
+   490→      setCustomSymbol("");
+   491→      toast.success(`${s} added to the watchlist.`);
+   492→    } catch (err) {
+   493→      toast.error(err instanceof Error ? err.message : `Could not add ${s}.`);
+   494→    }
+   495→  };
+   496→
+   497→  const removeSymbol = async (s: string) => {
+   498→    try {
+   499→      await fetchJSON(`/api/watchlist?symbol=${encodeURIComponent(s)}`, { method: "DELETE" });
+   500→    } catch (err) {
+   501→      toast.error(err instanceof Error ? err.message : "Remove failed");
+   502→      return;
+   503→    }
+   504→    const next = watchItems.filter((x) => x.symbol !== s);
+   505→    setWatchItems(next);
+   506→    if (s === symbol && next.length > 0) setSymbol(next[0].symbol);
+   507→  };
+   508→
+   509→  const toggleScan = async (item: WatchItemRow) => {
+   510→    const next = !item.scan;
+   511→    setWatchItems((items) => items.map((x) => (x.symbol === item.symbol ? { ...x, scan: next } : x)));
+   512→    try {
+   513→      await fetchJSON("/api/watchlist", {
+   514→        method: "PATCH",
+   515→        headers: { "Content-Type": "application/json" },
+   516→        body: JSON.stringify({ symbol: item.symbol, scan: next }),
+   517→      });
+   518→    } catch (err) {
+   519→      setWatchItems((items) => items.map((x) => (x.symbol === item.symbol ? { ...x, scan: item.scan } : x)));
+   520→      toast.error(err instanceof Error ? err.message : "Could not update the scan flag");
+   521→    }
+   522→  };
+   523→
+   524→  // ---- feed actions ----
+   525→  const deleteSignal = async (id: string) => {
+   526→    try {
+   527→      await fetchJSON(`/api/signals?id=${encodeURIComponent(id)}`, { method: "DELETE" });
+   528→      setFeed((f) => f.filter((x) => x.id !== id));
+   529→    } catch (err) {
+   530→      toast.error(err instanceof Error ? err.message : "Delete failed");
+   531→    }
+   532→  };
+   533→
+   534→  const clearAllSignals = async () => {
+   535→    if (!window.confirm("Delete all saved signals?")) return;
+   536→    try {
+   537→      await fetchJSON("/api/signals?all=1", { method: "DELETE" });
+   538→      setFeed([]);
+   539→      toast.success("Signal history cleared.");
+   540→    } catch (err) {
+   541→      toast.error(err instanceof Error ? err.message : "Clear failed");
+   542→    }
+   543→  };
+   544→
+   545→  // ---- derived ----
+   546→  const pending = status === "fetching" || status === "thinking";
+   547→  const cardSymbol = analyzedSymbol || symbol;
+   548→  const openTradeForSymbol = trades?.open.find((t) => t.symbol === symbol) ?? null;
+   549→  const openTradeForCard = trades?.open.find((t) => t.symbol === cardSymbol) ?? null;
+   550→  const chartLevels = openTradeForSymbol
+   551→    ? {
+   552→        direction: openTradeForSymbol.direction,
+   553→        entry: openTradeForSymbol.entryPrice,
+   554→        entryLow: openTradeForSymbol.entryPrice,
+   555→        entryHigh: openTradeForSymbol.entryPrice,
+   556→        stopLoss: openTradeForSymbol.stopLoss,
+   557→        takeProfit: openTradeForSymbol.takeProfit,
+   558→      }
+   559→    : signal && analyzedKey === `${symbol}|${timeframe}` && signal.direction !== "WAIT"
+   560→      ? {
+   561→          direction: signal.direction,
+   562→          entry: signal.entry,
+   563→          entryLow: signal.entryLow,
+   564→          entryHigh: signal.entryHigh,
+   565→          stopLoss: signal.stopLoss,
+   566→          takeProfit: signal.takeProfit,
+   567→        }
+   568→      : null;
+   569→
+   570→  const chartMarkers = React.useMemo<ChartMarker[]>(() => {
+   571→    if (candles.length === 0) return [];
+   572→    const first = candles[0].openTime;
+   573→    return feed
+   574→      .filter(
+   575→        (s): s is SignalRow & { direction: "BUY" | "SELL" } =>
+   576→          s.symbol === symbol && (s.direction === "BUY" || s.direction === "SELL"),
+   577→      )
+   578→      .map((s) => ({
+   579→        time: new Date(s.createdAt).getTime(),
+   580→        direction: s.direction,
+   581→        price: s.entry > 0 ? s.entry : s.price,
+   582→        at: s.createdAt,
+   583→      }))
+   584→      .filter((m) => m.time >= first)
+   585→      .sort((a, b) => a.time - b.time);
+   586→  }, [feed, symbol, candles]);
+   587→
+   588→  const remainingMs = nextScanAt !== null ? Math.max(0, nextScanAt - nowTick) : null;
+   589→  const countdown =
+   590→    remainingMs !== null
+   591→      ? `${Math.floor(remainingMs / 60000)}:${Math.floor((remainingMs % 60000) / 1000)
+   592→          .toString()
+   593→          .padStart(2, "0")}`
+   594→      : null;
+   595→  const countdownPct =
+   596→    remainingMs !== null ? Math.max(0, Math.min(100, (1 - remainingMs / (scanMinutes * 60000)) * 100)) : 0;
+   597→
+   598→  const filteredFeed = feedFilter === "all" ? feed : feed.filter((s) => s.symbol === feedFilter);
+   599→  const counts = feed.reduce(
+   600→    (acc, s) => {
+   601→      acc[s.direction] = (acc[s.direction] ?? 0) + 1;
+   602→      return acc;
+   603→    },
+   604→    {} as Record<string, number>,
+   605→  );
+   606→  const snapMatches = snapshot && analyzedKey === `${symbol}|${timeframe}` ? snapshot : null;
+   607→
+   608→  return (
+   609→    <div className="space-y-5">
+   610→      {/* intro */}
+   611→      <div className="flex flex-wrap items-end justify-between gap-3">
+   612→        <div>
+   613→          <h2 className="flex items-center gap-2 text-lg font-bold">
+   614→            <Activity className="size-5 text-amber-500" aria-hidden />
+   615→            Trading Signal Terminal
+   616→          </h2>
+   617→          <p className="mt-0.5 text-sm text-muted-foreground">
+   618→            Live Binance bars → Edge0 verdicts with entry, SL &amp; TP — plotted on the chart and ready to
+   619→            simulate as paper trades with full P&amp;L tracking.
+   620→          </p>
+   621→        </div>
+   622→        <Badge variant="outline" className="border-amber-300 bg-amber-50 text-[11px] text-amber-800 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-300">
+   623→          Educational study tool — not financial advice
+   624→        </Badge>
+   625→      </div>
+   626→
+   627→      {/* watchlist strip */}
+   628→      <div className="space-y-2">
+   629→        <div className="flex items-center justify-between">
+   630→          <p className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+   631→            <Radio className="size-3.5" aria-hidden /> Watchlist · live 24h · persisted
+   632→          </p>
+   633→          <div className="flex items-center gap-1.5">
+   634→            <Input
+   635→              value={customSymbol}
+   636→              onChange={(e) => setCustomSymbol(e.target.value.toUpperCase())}
+   637→              onKeyDown={(e) => {
+   638→                if (e.key === "Enter") void addSymbol();
+   639→              }}
+   640→              placeholder="Add e.g. LINKUSDT"
+   641→              className="h-8 w-40 text-xs"
+   642→              aria-label="Add symbol to watchlist"
+   643→            />
+   644→            <Button size="sm" variant="outline" className="h-8 gap-1 px-2" onClick={() => void addSymbol()}>
+   645→              <Plus className="size-3.5" aria-hidden /> Add
+   646→            </Button>
+   647→          </div>
+   648→        </div>
+   649→        <div className="custom-scrollbar flex gap-2 overflow-x-auto pb-1">
+   650→          {watchItems.map((item) => {
+   651→            const sym = item.symbol;
+   652→            const q = quotes[sym];
+   653→            const active = sym === symbol;
+   654→            const up = (q?.priceChangePercent ?? 0) >= 0;
+   655→            return (
+   656→              <div key={sym} className="relative shrink-0">
+   657→                {item.scan && (
+   658→                  <span
+   659→                    className="absolute -left-1 -top-1 z-10 size-2.5 rounded-full border border-background bg-amber-500"
+   660→                    title="Included in the auto-scan loop"
+   661→                    aria-hidden
+   662→                  />
+   663→                )}
+   664→                <button
+   665→                  type="button"
+   666→                  onClick={() => setSymbol(sym)}
+   667→                  className={`w-32 rounded-xl border p-2.5 text-left transition-colors ${
+   668→                    active
+   669→                      ? "border-amber-500 bg-amber-500/10"
+   670→                      : "border-border bg-card hover:border-amber-400/60 hover:bg-muted/50"
+   671→                  }`}
+   672→                  aria-pressed={active}
+   673→                  aria-label={`Show ${sym} chart`}
+   674→                >
+   675→                  <p className="flex items-center gap-1 text-xs font-bold">
+   676→                    {sym.replace("USDT", "")}
+   677→                    <span className="text-[9px] font-medium text-muted-foreground">/USDT</span>
+   678→                    {q && (
+   679→                      <span className={`ml-auto text-[10px] font-semibold ${up ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
+   680→                        {formatPct(q.priceChangePercent)}
+   681→                      </span>
+   682→                    )}
+   683→                  </p>
+   684→                  <p className="mt-1 font-mono text-sm font-semibold tabular-nums">
+   685→                    {q ? formatPrice(q.lastPrice) : <span className="text-muted-foreground">…</span>}
+   686→                  </p>
+   687→                  <p className="text-[10px] text-muted-foreground">
+   688→                    {q ? `Vol ${formatCompact(q.quoteVolume)}` : "loading"}
+   689→                  </p>
+   690→                </button>
+   691→                {watchlist.length > 1 && (
+   692→                  <button
+   693→                    type="button"
+   694→                    onClick={() => void removeSymbol(sym)}
+   695→                    className="absolute -right-1.5 -top-1.5 hidden rounded-full border bg-background p-0.5 text-muted-foreground hover:text-rose-500 sm:block"
+   696→                    aria-label={`Remove ${sym} from watchlist`}
+   697→                  >
+   698→                    <X className="size-3" aria-hidden />
+   699→                  </button>
+   700→                )}
+   701→              </div>
+   702→            );
+   703→          })}
+   704→        </div>
+   705→      </div>
+   706→
+   707→      {/* chart + engine */}
+   708→      <div className="grid gap-4 lg:grid-cols-5">
+   709→        {/* chart card */}
+   710→        <Card className="lg:col-span-3">
+   711→          <CardHeader className="pb-2">
+   712→            <div className="flex flex-wrap items-center justify-between gap-2">
+   713→              <CardTitle className="flex items-center gap-2 text-base">
+   714→                <span className="font-mono">{symbol}</span>
+   715→                <span className="text-sm font-normal text-muted-foreground">· Binance spot</span>
+   716→                {openTradeForSymbol && (
+   717→                  <span className="rounded-full border border-amber-300 bg-amber-50 px-2 py-0.5 text-[10px] font-bold text-amber-800 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-300">
+   718→                    ● position open
+   719→                  </span>
+   720→                )}
+   721→                {ticker && (
+   722→                  <span className={`text-sm font-bold ${ticker.priceChangePercent >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
+   723→                    {formatPrice(ticker.lastPrice)}{" "}
+   724→                    <span className="text-xs font-semibold">{formatPct(ticker.priceChangePercent)}</span>
+   725→                  </span>
+   726→                )}
+   727→              </CardTitle>
+   728→              <div className="flex items-center gap-1">
+   729→                <div className="flex rounded-lg border p-0.5" role="group" aria-label="Chart timeframe">
+   730→                  {TIMEFRAMES.map((tf) => (
+   731→                    <button
+   732→                      key={tf}
+   733→                      type="button"
+   734→                      onClick={() => setTimeframe(tf)}
+   735→                      className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
+   736→                        timeframe === tf
+   737→                          ? "bg-zinc-900 text-amber-300 dark:bg-amber-500 dark:text-zinc-950"
+   738→                          : "text-muted-foreground hover:bg-muted"
+   739→                      }`}
+   740→                      aria-pressed={timeframe === tf}
+   741→                    >
+   742→                      {tf}
+   743→                    </button>
+   744→                  ))}
+   745→                </div>
+   746→                <Button
+   747→                  size="icon"
+   748→                  variant="ghost"
+   749→                  className="size-8"
+   750→                  onClick={() => void loadChart()}
+   751→                  aria-label="Refresh chart"
+   752→                >
+   753→                  <RefreshCw className={`size-4 ${chartLoading ? "animate-spin" : ""}`} aria-hidden />
+   754→                </Button>
+   755→              </div>
+   756→            </div>
+   757→          </CardHeader>
+   758→          <CardContent className="space-y-2">
+   759→            {chartError ? (
+   760→              <div className="flex h-64 flex-col items-center justify-center gap-2 text-center">
+   761→                <p className="text-sm font-medium text-rose-600 dark:text-rose-400">{chartError}</p>
+   762→                <Button size="sm" variant="outline" onClick={() => void loadChart()}>
+   763→                  Retry
+   764→                </Button>
+   765→              </div>
+   766→            ) : chartLoading && candles.length === 0 ? (
+   767→              <div className="space-y-2">
+   768→                <div className="h-72 animate-pulse rounded-lg bg-muted" />
+   769→                <div className="h-4 w-2/3 animate-pulse rounded bg-muted" />
+   770→              </div>
+   771→            ) : (
+   772→              <CandleChart candles={candles} interval={timeframe} levels={chartLevels} markers={chartMarkers} />
+   773→            )}
+   774→            <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
+   775→              {ticker && (
+   776→                <>
+   777→                  <span>24h high {formatPrice(ticker.highPrice)}</span>
+   778→                  <span>24h low {formatPrice(ticker.lowPrice)}</span>
+   779→                  <span>24h vol {formatCompact(ticker.quoteVolume)}</span>
+   780→                </>
+   781→              )}
+   782→              {snapMatches && (
+   783→                <>
+   784→                  <span className="text-amber-600 dark:text-amber-400">RSI {snapMatches.rsi14.toFixed(1)}</span>
+   785→                  <span>ATR {formatPrice(snapMatches.atr14)} ({snapMatches.atrPct.toFixed(2)}%)</span>
+   786→                  <span className="truncate">{snapMatches.trendLabel}</span>
+   787→                </>
+   788→              )}
+   789→              {chartLevels && (
+   790→                <span className="font-semibold text-amber-600 dark:text-amber-400">
+   791→                  dashed lines = {openTradeForSymbol ? "open paper position levels" : "last signal levels"}
+   792→                </span>
+   793→              )}
+   794→            </div>
+   795→          </CardContent>
+   796→        </Card>
+   797→
+   798→        {/* engine card */}
+   799→        <Card className="lg:col-span-2">
+   800→          <CardHeader className="pb-2">
+   801→            <CardTitle className="flex items-center gap-2 text-base">
+   802→              <Crosshair className="size-4 text-amber-500" aria-hidden />
+   803→              Signal engine
+   804→            </CardTitle>
+   805→          </CardHeader>
+   806→          <CardContent className="space-y-3">
+   807→            <div className="grid grid-cols-2 gap-2">
+   808→              <div className="space-y-1">
+   809→                <p className="text-[11px] font-medium text-muted-foreground">Model</p>
+   810→                <Select value={model} onValueChange={setModel}>
+   811→                  <SelectTrigger className="h-8 text-xs" aria-label="Analysis model">
+   812→                    <SelectValue />
+   813→                  </SelectTrigger>
+   814→                  <SelectContent>
+   815→                    <SelectItem value="edge0-35b">edge0-35b · deep</SelectItem>
+   816→                    <SelectItem value="edge0-8b">edge0-8b · fast</SelectItem>
+   817→                  </SelectContent>
+   818→                </Select>
+   819→              </div>
+   820→              <div className="space-y-1">
+   821→                <p className="text-[11px] font-medium text-muted-foreground">Risk profile</p>
+   822→                <Select value={riskProfile} onValueChange={setRiskProfile}>
+   823→                  <SelectTrigger className="h-8 text-xs" aria-label="Risk profile">
+   824→                    <SelectValue />
+   825→                  </SelectTrigger>
+   826→                  <SelectContent>
+   827→                    {RISK_PROFILES.map((r) => (
+   828→                      <SelectItem key={r.value} value={r.value}>
+   829→                        {r.label}
+   830→                      </SelectItem>
+   831→                    ))}
+   832→                  </SelectContent>
+   833→                </Select>
+   834→              </div>
+   835→            </div>
+   836→            <p className="text-[11px] text-muted-foreground">
+   837→              {RISK_PROFILES.find((r) => r.value === riskProfile)?.hint}
+   838→            </p>
+   839→            <Button
+   840→              onClick={() => void analyzeNow()}
+   841→              disabled={pending}
+   842→              className="w-full gap-2 bg-zinc-900 font-semibold text-amber-300 hover:bg-zinc-800 dark:bg-amber-500 dark:text-zinc-950 dark:hover:bg-amber-400"
+   843→            >
+   844→              {pending ? (
+   845→                <>
+   846→                  <Loader2 className="size-4 animate-spin" aria-hidden />
+   847→                  {status === "fetching" ? "Fetching bars…" : "Model reasoning…"}
+   848→                </>
+   849→              ) : (
+   850→                <>
+   851→                  <Zap className="size-4" aria-hidden />
+   852→                  Analyze {symbol} now
+   853→                </>
+   854→              )}
+   855→            </Button>
+   856→            <div className="custom-scrollbar max-h-[540px] overflow-y-auto pr-1">
+   857→              <SignalCard
+   858→                status={status}
+   859→                symbol={cardSymbol}
+   860→                interval={timeframe}
+   861→                signal={signal}
+   862→                snapshot={snapshot}
+   863→                rationale={rationale}
+   864→                streaming={streaming}
+   865→                error={analysisError}
+   866→                model={model}
+   867→                latencyMs={latency}
+   868→                source="manual"
+   869→                canSimulate={!!signalId && signal !== null && signal.direction !== "WAIT" && !openTradeForCard}
+   870→                simulating={!!signalId && simulatingId === signalId}
+   871→                notional={notional}
+   872→                onNotionalChange={setNotional}
+   873→                onSimulate={signalId ? () => void simulateTrade(signalId) : undefined}
+   874→                openTradeHint={
+   875→                  openTradeForCard
+   876→                    ? `Paper position already open for ${cardSymbol} — close it before simulating another.`
+   877→                    : null
+   878→                }
+   879→              />
+   880→            </div>
+   881→          </CardContent>
+   882→        </Card>
+   883→      </div>
+   884→
+   885→      {/* auto scan */}
+   886→      <Card>
+   887→        <CardHeader className="pb-2">
+   888→          <div className="flex flex-wrap items-center justify-between gap-3">
+   889→            <CardTitle className="flex items-center gap-2 text-base">
+   890→              <Timer className="size-4 text-amber-500" aria-hidden />
+   891→              Auto-scan loop
+   892→              <span className="text-xs font-normal text-muted-foreground">
+   893→                periodically feeds fresh bars to the model
+   894→              </span>
+   895→            </CardTitle>
+   896→            <div className="flex items-center gap-2">
+   897→              <span className="text-xs text-muted-foreground">{autoOn ? "On" : "Off"}</span>
+   898→              <Switch checked={autoOn} onCheckedChange={toggleAuto} aria-label="Toggle auto-scan" />
+   899→            </div>
+   900→          </div>
+   901→        </CardHeader>
+   902→        <CardContent className="grid gap-4 md:grid-cols-2">
+   903→          <div className="space-y-3">
+   904→            <div className="flex flex-wrap items-center gap-2">
+   905→              <p className="text-xs font-medium text-muted-foreground">Every</p>
+   906→              <div className="flex rounded-lg border p-0.5" role="group" aria-label="Scan interval">
+   907→                {SCAN_INTERVALS.map((m) => (
+   908→                  <button
+   909→                    key={m}
+   910→                    type="button"
+   911→                    onClick={() => setScanMinutes(m)}
+   912→                    className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
+   913→                      scanMinutes === m
+   914→                        ? "bg-zinc-900 text-amber-300 dark:bg-amber-500 dark:text-zinc-950"
+   915→                        : "text-muted-foreground hover:bg-muted"
+   916→                    }`}
+   917→                    aria-pressed={scanMinutes === m}
+   918→                  >
+   919→                    {m}m
+   920→                  </button>
+   921→                ))}
+   922→              </div>
+   923→              <Button
+   924→                size="sm"
+   925→                variant="outline"
+   926→                className="h-8 gap-1.5"
+   927→                onClick={() => void runScan()}
+   928→                disabled={runningRef.current}
+   929→              >
+   930→                <Play className="size-3.5" aria-hidden /> Run now
+   931→              </Button>
+   932→            </div>
+   933→            <div>
+   934→              <p className="mb-1.5 text-xs font-medium text-muted-foreground">Symbols in the loop</p>
+   935→              <div className="flex flex-wrap gap-1.5">
+   936→                {watchItems.map((item) => (
+   937→                  <button
+   938→                    key={item.symbol}
+   939→                    type="button"
+   940→                    onClick={() => void toggleScan(item)}
+   941→                    className={`rounded-full border px-2.5 py-1 font-mono text-[11px] font-semibold transition-colors ${
+   942→                      item.scan
+   943→                        ? "border-amber-500 bg-amber-500/15 text-amber-700 dark:text-amber-400"
+   944→                        : "border-border text-muted-foreground hover:bg-muted"
+   945→                    }`}
+   946→                    aria-pressed={item.scan}
+   947→                    aria-label={`${item.scan ? "Remove" : "Add"} ${item.symbol} ${item.scan ? "from" : "to"} the auto-scan loop`}
+   948→                  >
+   949→                    {item.symbol}
+   950→                  </button>
+   951→                ))}
+   952→              </div>
+   953→            </div>
+   954→          </div>
+   955→          <div className="space-y-2 rounded-xl border bg-muted/30 p-3">
+   956→            {scanProgress ? (
+   957→              <p className="flex items-center gap-2 text-sm font-medium">
+   958→                <Loader2 className="size-4 animate-spin text-amber-500" aria-hidden />
+   959→                {scanProgress}
+   960→              </p>
+   961→            ) : autoOn && countdown ? (
+   962→              <>
+   963→                <div className="flex items-center justify-between text-sm">
+   964→                  <span className="text-muted-foreground">Next scan in</span>
+   965→                  <span className="font-mono text-lg font-bold tabular-nums">{countdown}</span>
+   966→                </div>
+   967→                <Progress value={countdownPct} className="h-1.5" aria-label="Time until next scan" />
+   968→              </>
+   969→            ) : (
+   970→              <p className="text-sm text-muted-foreground">
+   971→                Turn the loop on and the terminal will fetch fresh bars for each selected symbol every{" "}
+   972→                {scanMinutes} minutes, ask the model for BUY / SELL / WAIT verdicts with entry, SL and TP,
+   973→                and file every result into the feed below.
+   974→              </p>
+   975→            )}
+   976→            <p className="text-[11px] text-muted-foreground">
+   977→              Results persist to the database and appear in the feed even while you&apos;re on another tab.
+   978→            </p>
+   979→          </div>
+   980→        </CardContent>
+   981→      </Card>
+   982→
+   983→      {/* paper trading */}
+   984→      <div className="space-y-2">
+   985→        <div className="flex flex-wrap items-center justify-between gap-2">
+   986→          <h3 className="flex items-center gap-2 text-sm font-bold">
+   987→            <Wallet className="size-4 text-amber-500" aria-hidden />
+   988→            Paper trading account
+   989→            <span className="text-xs font-normal text-muted-foreground">
+   990→              simulated fills at live Binance prices · P&amp;L stored in the database
+   991→            </span>
+   992→          </h3>
+   993→          <Button
+   994→            size="sm"
+   995→            variant="ghost"
+   996→            className="h-7 gap-1 text-muted-foreground hover:text-rose-500"
+   997→            onClick={() => void resetAccount()}
+   998→          >
+   999→            <Trash2 className="size-3.5" aria-hidden /> Reset account
+  1000→          </Button>
+  1001→        </div>
+  1002→        <TradesPanel
+  1003→          trades={trades}
+  1004→          loading={tradesLoading}
+  1005→          onCloseTrade={(id) => void closeTrade(id)}
+  1006→          closingId={closingId}
+  1007→          onDeleteClosed={() => void clearClosedTrades()}
+  1008→          onSelectSymbol={(s) => setSymbol(s)}
+  1009→        />
+  1010→      </div>
+  1011→
+  1012→      {/* feed */}
+  1013→      <Card>
+  1014→        <CardHeader className="pb-2">
+  1015→          <div className="flex flex-wrap items-center justify-between gap-2">
+  1016→            <CardTitle className="flex items-center gap-2 text-base">
+  1017→              Signal feed
+  1018→              <span className="flex gap-1.5 text-xs font-normal">
+  1019→                {counts.BUY ? (
+  1020→                  <span className="rounded-full bg-emerald-100 px-2 py-0.5 font-semibold text-emerald-700 dark:bg-emerald-950 dark:text-emerald-400">
+  1021→                    {counts.BUY} buy
+  1022→                  </span>
+  1023→                ) : null}
+  1024→                {counts.SELL ? (
+  1025→                  <span className="rounded-full bg-rose-100 px-2 py-0.5 font-semibold text-rose-700 dark:bg-rose-950 dark:text-rose-400">
+  1026→                    {counts.SELL} sell
+  1027→                  </span>
+  1028→                ) : null}
+  1029→                {counts.WAIT ? (
+  1030→                  <span className="rounded-full bg-zinc-100 px-2 py-0.5 font-semibold text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400">
+  1031→                    {counts.WAIT} wait
+  1032→                  </span>
+  1033→                ) : null}
+  1034→              </span>
+  1035→            </CardTitle>
+  1036→            <div className="flex items-center gap-2">
+  1037→              <Select value={feedFilter} onValueChange={setFeedFilter}>
+  1038→                <SelectTrigger className="h-8 w-36 text-xs" aria-label="Filter feed by symbol">
+  1039→                  <SelectValue />
+  1040→                </SelectTrigger>
+  1041→                <SelectContent>
+  1042→                  <SelectItem value="all">All symbols</SelectItem>
+  1043→                  {watchlist.map((s) => (
+  1044→                    <SelectItem key={s} value={s}>
+  1045→                      {s}
+  1046→                    </SelectItem>
+  1047→                  ))}
+  1048→                </SelectContent>
+  1049→              </Select>
+  1050→              <Button size="sm" variant="ghost" className="h-8 gap-1 text-muted-foreground hover:text-rose-500" onClick={() => void clearAllSignals()}>
+  1051→                <Trash2 className="size-3.5" aria-hidden /> Clear
+  1052→              </Button>
+  1053→            </div>
+  1054→          </div>
+  1055→        </CardHeader>
+  1056→        <CardContent>
+  1057→          {feedLoading ? (
+  1058→            <div className="space-y-2">
+  1059→              {[0, 1, 2].map((i) => (
+  1060→                <div key={i} className="h-12 animate-pulse rounded-lg bg-muted" />
+  1061→              ))}
+  1062→            </div>
+  1063→          ) : filteredFeed.length === 0 ? (
+  1064→            <p className="py-8 text-center text-sm text-muted-foreground">
+  1065→              No signals yet — analyze a symbol or arm the auto-scan loop.
+  1066→            </p>
+  1067→          ) : (
+  1068→            <div className="custom-scrollbar max-h-96 space-y-1.5 overflow-y-auto pr-1">
+  1069→              {filteredFeed.map((s) => {
+  1070→                const meta = SIGNAL_META[s.direction];
+  1071→                const open = expandedId === s.id;
+  1072→                return (
+  1073→                  <div key={s.id} className="rounded-lg border">
+  1074→                    <button
+  1075→                      type="button"
+  1076→                      className="flex w-full flex-wrap items-center gap-2 p-2.5 text-left hover:bg-muted/40"
+  1077→                      onClick={() => setExpandedId(open ? null : s.id)}
+  1078→                      aria-expanded={open}
+  1079→                    >
+  1080→                      {open ? (
+  1081→                        <ChevronDown className="size-4 shrink-0 text-muted-foreground" aria-hidden />
+  1082→                      ) : (
+  1083→                        <ChevronRight className="size-4 shrink-0 text-muted-foreground" aria-hidden />
+  1084→                      )}
+  1085→                      <span className={`inline-flex items-center rounded-md border px-2 py-0.5 text-[11px] font-bold ${meta.badge}`}>
+  1086→                        {s.direction}
+  1087→                      </span>
+  1088→                      <span className="font-mono text-xs font-semibold">{s.symbol}</span>
+  1089→                      <span className="text-[11px] text-muted-foreground">{s.interval}</span>
+  1090→                      <span className="hidden font-mono text-[11px] text-muted-foreground sm:inline">
+  1091→                        E {formatPrice(s.entry)} · SL {formatPrice(s.stopLoss)} · TP {formatPrice(s.takeProfit)}
+  1092→                      </span>
+  1093→                      <span className="ml-auto flex items-center gap-2 text-[11px] text-muted-foreground">
+  1094→                        <span className="font-semibold text-amber-600 dark:text-amber-400">R:R {s.rrRatio.toFixed(2)}</span>
+  1095→                        <span>{Math.round(s.confidence * 100)}%</span>
+  1096→                        <span className="hidden sm:inline">{s.source === "auto" ? "auto" : "manual"}</span>
+  1097→                        <span>{timeAgo(s.createdAt)}</span>
+  1098→                      </span>
+  1099→                    </button>
+  1100→                    {open && (
+  1101→                      <div className="space-y-2 border-t px-3 py-2.5">
+  1102→                        <p className="text-xs leading-relaxed">{s.summary}</p>
+  1103→                        {s.reasons.length > 0 && (
+  1104→                          <ul className="space-y-1">
+  1105→                            {s.reasons.map((r, i) => (
+  1106→                              <li key={i} className="text-[11px] leading-relaxed text-muted-foreground">
+  1107→                                · {r}
+  1108→                              </li>
+  1109→                            ))}
+  1110→                          </ul>
+  1111→                        )}
+  1112→                        {s.rationale && <p className="text-[11px] italic leading-relaxed text-muted-foreground">{s.rationale}</p>}
+  1113→                        <p className="text-[10px] text-muted-foreground">
+  1114→                          {s.model} · {(s.latencyMs / 1000).toFixed(1)}s · at {formatPrice(s.price)}
+  1115→                          {s.risks.length > 0 ? ` · risks: ${s.risks.join(" / ")}` : ""}
+  1116→                        </p>
+  1117→                        <div className="flex flex-wrap items-center justify-end gap-1.5">
+  1118→                          {s.symbol !== symbol && (
+  1119→                            <Button
+  1120→                              size="sm"
+  1121→                              variant="ghost"
+  1122→                              className="h-7 gap-1 text-[11px] text-muted-foreground hover:text-amber-600 dark:hover:text-amber-400"
+  1123→                              onClick={() => {
+  1124→                                setSymbol(s.symbol);
+  1125→                                setExpandedId(null);
+  1126→                              }}
+  1127→                              aria-label={`View ${s.symbol} chart`}
+  1128→                            >
+  1129→                              <Eye className="size-3" aria-hidden /> View chart
+  1130→                            </Button>
+  1131→                          )}
+  1132→                          {(s.direction === "BUY" || s.direction === "SELL") && (
+  1133→                            <Button
+  1134→                              size="sm"
+  1135→                              variant="ghost"
+  1136→                              className="h-7 gap-1 text-[11px] font-semibold text-emerald-700 hover:text-emerald-600 dark:text-emerald-500 dark:hover:text-emerald-400"
+  1137→                              disabled={
+  1138→                                simulatingId === s.id || !!trades?.open.some((t) => t.symbol === s.symbol)
+  1139→                              }
+  1140→                              title={
+  1141→                                trades?.open.some((t) => t.symbol === s.symbol)
+  1142→                                  ? "A paper position is already open for this symbol"
+  1143→                                  : `Simulate a ${s.direction === "BUY" ? "long" : "short"} trade of ${notional} USDT`
+  1144→                              }
+  1145→                              onClick={() => void simulateTrade(s.id)}
+  1146→                            >
+  1147→                              {simulatingId === s.id ? (
+  1148→                                <Loader2 className="size-3 animate-spin" aria-hidden />
+  1149→                              ) : (
+  1150→                                <Zap className="size-3" aria-hidden />
+  1151→                              )}
+  1152→                              Simulate
+  1153→                            </Button>
+  1154→                          )}
+  1155→                          <Button
+  1156→                            size="sm"
+  1157→                            variant="ghost"
+  1158→                            className="h-7 gap-1 text-[11px] text-muted-foreground hover:text-rose-500"
+  1159→                            onClick={() => void deleteSignal(s.id)}
+  1160→                          >
+  1161→                            <Trash2 className="size-3" aria-hidden /> Delete
+  1162→                          </Button>
+  1163→                        </div>
+  1164→                      </div>
+  1165→                    )}
+  1166→                  </div>
+  1167→                );
+  1168→              })}
+  1169→            </div>
+  1170→          )}
+  1171→        </CardContent>
+  1172→      </Card>
+  1173→    </div>
+  1174→  );
+  1175→}
+  1176→

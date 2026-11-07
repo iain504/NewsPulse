@@ -65,6 +65,23 @@ const EXIT_CHIP: Record<TradeExitReason, { label: string; className: string }> =
   },
 };
 
+const AUTO_CHIP =
+  "border-amber-300 bg-amber-100 text-amber-800 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-300";
+
+function SourceChip({ source }: { source: "MANUAL" | "AUTO" }) {
+  if (source === "AUTO") {
+    return (
+      <span
+        className={`rounded-md border px-1.5 py-0.5 text-[10px] font-bold ${AUTO_CHIP}`}
+        title="Opened by the auto-trade engine (R:R + confidence gates)"
+      >
+        AUTO
+      </span>
+    );
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // Small formatting helpers
 // ---------------------------------------------------------------------------
@@ -135,6 +152,7 @@ function OpenPositionItem({
         <Badge className={isLong ? LONG_CHIP : SHORT_CHIP}>
           {isLong ? "LONG" : "SHORT"}
         </Badge>
+        <SourceChip source={t.source} />
         <button
           type="button"
           onClick={() => onSelectSymbol(t.symbol)}
@@ -224,6 +242,7 @@ function ClosedTradeItem({ trade: t, onSelectSymbol }: ClosedTradeItemProps) {
       >
         {isLong ? "LONG" : "SHORT"}
       </span>
+      <SourceChip source={t.source} />
       <button
         type="button"
         onClick={() => onSelectSymbol(t.symbol)}
@@ -338,8 +357,8 @@ function TradesPanelImpl({
         <CardContent>
           {open.length === 0 ? (
             <div className="rounded-xl border border-dashed p-6 text-center text-sm text-muted-foreground">
-              No open paper trades — simulate one from a BUY/SELL signal in the feed or the signal
-              card.
+              No open paper trades — simulate one from a BUY/SELL signal, or arm the auto-trade engine
+              and let qualifying signals trade themselves.
             </div>
           ) : (
             <div
@@ -400,9 +419,10 @@ function TradesPanelImpl({
       </Card>
 
       <p className="text-[11px] text-muted-foreground">
-        Paper trades fill at the live Binance price. Positions auto-close when price touches SL or
-        TP (stop-loss is evaluated first if both are hit between refreshes). Educational simulation
-        — no real funds.
+        Paper trades fill at the live Binance price. Single-position mode: one trade at a time — long
+        or short, never both. Positions auto-close when price touches SL or TP (stop-loss is evaluated
+        first if both are hit between refreshes). AUTO marks trades opened by the R:R + confidence
+        engine. Educational simulation — no real funds.
       </p>
     </div>
   );

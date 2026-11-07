@@ -46,6 +46,7 @@ export function toTradeRow(t: Trade): TradeRow {
     quantity: t.quantity,
     notional: t.notional,
     status: t.status === "CLOSED" ? "CLOSED" : "OPEN",
+    source: t.source === "AUTO" ? "AUTO" : "MANUAL",
     exitPrice: t.exitPrice,
     pnl: t.pnl,
     pnlPct: t.pnlPct,

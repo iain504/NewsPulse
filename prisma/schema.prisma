@@ -111,6 +111,8 @@ model Trade {
   notional    Float
   // OPEN | CLOSED
   status      String    @default("OPEN")
+  // MANUAL | AUTO (auto = opened by the R:R + confidence auto-trade engine)
+  source      String    @default("MANUAL")
   exitPrice   Float?
   pnl         Float?
   pnlPct      Float?

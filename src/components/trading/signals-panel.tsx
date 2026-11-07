@@ -3,6 +3,7 @@
 import * as React from "react";
 import {
   Activity,
+  Bot,
   ChevronDown,
   ChevronRight,
   Crosshair,
@@ -32,6 +33,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
 import { CandleChart } from "@/components/trading/candle-chart";
 import { SignalCard, type SignalStatus } from "@/components/trading/signal-card";
@@ -57,6 +59,13 @@ import {
 } from "@/lib/types";
 
 const SYMBOL_RE = /^[A-Z0-9]{5,15}$/;
+
+interface AutoLogEntry {
+  id: number;
+  ts: number;
+  text: string;
+  kind: "opened" | "skipped" | "error";
+}
 
 interface SnapshotEvent {
   snapshot: MarketSnapshot;
@@ -102,7 +111,17 @@ export function SignalsPanel() {
   const [nextScanAt, setNextScanAt] = React.useState<number | null>(null);
   const [nowTick, setNowTick] = React.useState(Date.now());
   const [scanProgress, setScanProgress] = React.useState<string | null>(null);
+  const [scanning, setScanning] = React.useState(false);
   const runningRef = React.useRef(false);
+
+  // ---- auto trade (R:R + confidence gated) ----
+  const [autoTradeOn, setAutoTradeOn] = React.useState(false);
+  const [minConfidence, setMinConfidence] = React.useState(70);
+  const [minRR, setMinRR] = React.useState(1.8);
+  const [autoLog, setAutoLog] = React.useState<AutoLogEntry[]>([]);
+  const autoLogIdRef = React.useRef(0);
+  const autoCfgRef = React.useRef({ autoTradeOn, minConfidence, minRR, notional: 500 });
+  const autoSignalRef = React.useRef<StructuredSignal | null>(null);
 
   const watchlist = React.useMemo(() => watchItems.map((i) => i.symbol), [watchItems]);
   const scanSymbols = React.useMemo(() => watchItems.filter((i) => i.scan).map((i) => i.symbol), [watchItems]);
@@ -153,6 +172,37 @@ export function SignalsPanel() {
   React.useEffect(() => {
     localStorage.setItem("np.scan", JSON.stringify({ minutes: scanMinutes }));
   }, [scanMinutes]);
+
+  // restore auto-trade thresholds (the switch itself always starts off)
+  React.useEffect(() => {
+    try {
+      const saved = localStorage.getItem("np.autotrade");
+      if (!saved) return;
+      const cfg = JSON.parse(saved) as { minConfidence?: number; minRR?: number };
+      if (
+        typeof cfg.minConfidence === "number" &&
+        cfg.minConfidence >= 50 &&
+        cfg.minConfidence <= 95
+      ) {
+        setMinConfidence(Math.round(cfg.minConfidence));
+      }
+      if (typeof cfg.minRR === "number" && cfg.minRR >= 1 && cfg.minRR <= 3) {
+        setMinRR(cfg.minRR);
+      }
+    } catch {
+      // ignore malformed storage
+    }
+  }, []);
+
+  React.useEffect(() => {
+    localStorage.setItem("np.autotrade", JSON.stringify({ minConfidence, minRR }));
+  }, [minConfidence, minRR]);
+
+  // keep the auto-trade config available to long-lived scan closures without
+  // re-creating the callbacks mid-run
+  React.useEffect(() => {
+    autoCfgRef.current = { autoTradeOn, minConfidence, minRR, notional };
+  }, [autoTradeOn, minConfidence, minRR, notional]);
 
   // ---- DB-backed watchlist ----
   const loadWatchlist = React.useCallback(async () => {
@@ -251,6 +301,74 @@ export function SignalsPanel() {
     return () => clearInterval(iv);
   }, [loadTrades]);
 
+  // ---- auto-trade decision log ----
+  const pushAutoLog = React.useCallback((text: string, kind: AutoLogEntry["kind"]) => {
+    setAutoLog((log) => [{ id: ++autoLogIdRef.current, ts: Date.now(), text, kind }, ...log].slice(0, 12));
+  }, []);
+
+  /**
+   * Auto-trade gate: open a paper trade from a scan signal only when the
+   * signal passes the confidence AND reward:risk thresholds, and the account
+   * is flat (single-position mode). Every decision lands in the log.
+   */
+  const maybeAutoTrade = React.useCallback(
+    async (sigId: string, sig: StructuredSignal, sym: string) => {
+      const cfg = autoCfgRef.current;
+      if (!cfg.autoTradeOn) return;
+
+      const confPct = Math.round(sig.confidence * 100);
+      if (sig.direction !== "BUY" && sig.direction !== "SELL") {
+        pushAutoLog(`${sym} WAIT (${confPct}%) — no trade taken`, "skipped");
+        return;
+      }
+      const label = `${sym} ${sig.direction}`;
+      if (confPct < cfg.minConfidence) {
+        pushAutoLog(`${label} skipped — confidence ${confPct}% < ${cfg.minConfidence}%`, "skipped");
+        return;
+      }
+      if (sig.rrRatio < cfg.minRR) {
+        pushAutoLog(`${label} skipped — R:R ${sig.rrRatio.toFixed(2)} < ${cfg.minRR.toFixed(1)}`, "skipped");
+        return;
+      }
+
+      // single-position check against a fresh server snapshot (it also
+      // settles any position whose SL/TP was just touched)
+      try {
+        const fresh = await fetchJSON<TradesResponse>("/api/trades");
+        if (fresh.open.length > 0) {
+          pushAutoLog(
+            `${label} skipped — ${fresh.open[0].symbol} still open (one trade at a time)`,
+            "skipped",
+          );
+          return;
+        }
+      } catch {
+        // fall through — the server re-validates on POST anyway
+      }
+
+      try {
+        const res = await fetchJSON<{ ok: boolean; trade: OpenTradeRow }>("/api/trades", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ signalId: sigId, notional: cfg.notional, source: "AUTO" }),
+        });
+        pushAutoLog(
+          `${label} opened @ ${formatPrice(res.trade.entryPrice)} · ${res.trade.notional.toLocaleString()} USDT · R:R ${sig.rrRatio.toFixed(2)} · ${confPct}%`,
+          "opened",
+        );
+        toast.success(`Auto-trade opened — ${label} @ ${formatPrice(res.trade.entryPrice)}`, {
+          description: `confidence ${confPct}% · R:R ${sig.rrRatio.toFixed(2)} · SL ${formatPrice(res.trade.stopLoss)} · TP ${formatPrice(res.trade.takeProfit)}`,
+        });
+        await loadTrades();
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "auto-trade failed";
+        pushAutoLog(`${label} failed — ${msg}`, "error");
+        toast.error(`Auto-trade rejected — ${msg}`);
+      }
+    },
+    [loadTrades, pushAutoLog],
+  );
+
   // ---- paper trade actions ----
   const simulateTrade = React.useCallback(
     async (sigId: string) => {
@@ -329,6 +447,7 @@ export function SignalsPanel() {
   // ---- SSE analysis ----
   const analyzeSymbol = React.useCallback(
     async (sym: string, source: "manual" | "auto", silent: boolean): Promise<void> => {
+      autoSignalRef.current = null;
       if (!silent) {
         setStatus("fetching");
         setSignal(null);
@@ -366,6 +485,7 @@ export function SignalsPanel() {
                   if (sig.direction === "BUY") toast.success(headline, { description: detail });
                   else toast.warning(headline, { description: detail });
                 }
+                if (silent) autoSignalRef.current = sig;
               } else if (event === "delta") {
                 if (!silent) {
                   setStreaming(true);
@@ -376,6 +496,11 @@ export function SignalsPanel() {
                 if (doneData?.id) setSignalId(doneData.id);
                 if (!silent) setStreaming(false);
                 void refreshFeed();
+                const pendingSig = autoSignalRef.current;
+                autoSignalRef.current = null;
+                if (silent && doneData?.id && pendingSig) {
+                  void maybeAutoTrade(doneData.id, pendingSig, sym);
+                }
               } else if (event === "error") {
                 errored = true;
                 errorMessage = (data as ErrorEvent).message;
@@ -406,7 +531,7 @@ export function SignalsPanel() {
       }
       if (errored) throw new Error(errorMessage || `${sym}: analysis failed`);
     },
-    [timeframe, model, riskProfile, refreshFeed],
+    [timeframe, model, riskProfile, refreshFeed, maybeAutoTrade],
   );
 
   const analyzeNow = React.useCallback(async () => {
@@ -422,6 +547,7 @@ export function SignalsPanel() {
     if (runningRef.current) return;
     const list = scanSymbols.length > 0 ? scanSymbols : [symbol];
     runningRef.current = true;
+    setScanning(true);
     try {
       for (let i = 0; i < list.length; i++) {
         const sym = list[i];
@@ -435,6 +561,7 @@ export function SignalsPanel() {
       toast.success(`Auto-scan complete — ${list.length} symbol${list.length === 1 ? "" : "s"} checked.`);
     } finally {
       runningRef.current = false;
+      setScanning(false);
       setScanProgress(null);
       setNextScanAt(Date.now() + scanMinutes * 60_000);
     }
@@ -465,6 +592,15 @@ export function SignalsPanel() {
       toast.info(`Auto-scan armed — every ${scanMinutes} min across ${scanSymbols.length || 1} symbol(s).`);
     } else {
       setNextScanAt(null);
+    }
+  };
+
+  const toggleAutoTrade = (on: boolean) => {
+    setAutoTradeOn(on);
+    if (on) {
+      toast.info(`Auto-trade armed — confidence ≥ ${minConfidence}% · R:R ≥ ${minRR.toFixed(1)} · one trade at a time.`);
+    } else {
+      toast.info("Auto-trade disarmed — new signals will not open trades.");
     }
   };
 
@@ -546,7 +682,6 @@ export function SignalsPanel() {
   const pending = status === "fetching" || status === "thinking";
   const cardSymbol = analyzedSymbol || symbol;
   const openTradeForSymbol = trades?.open.find((t) => t.symbol === symbol) ?? null;
-  const openTradeForCard = trades?.open.find((t) => t.symbol === cardSymbol) ?? null;
   const chartLevels = openTradeForSymbol
     ? {
         direction: openTradeForSymbol.direction,
@@ -616,7 +751,8 @@ export function SignalsPanel() {
           </h2>
           <p className="mt-0.5 text-sm text-muted-foreground">
             Live Binance bars → Edge0 verdicts with entry, SL &amp; TP — plotted on the chart and ready to
-            simulate as paper trades with full P&amp;L tracking.
+            simulate as paper trades. One position at a time, with an optional auto-trade engine that
+            only takes signals clearing your R:R and confidence gates.
           </p>
         </div>
         <Badge variant="outline" className="border-amber-300 bg-amber-50 text-[11px] text-amber-800 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-300">
@@ -866,14 +1002,16 @@ export function SignalsPanel() {
                 model={model}
                 latencyMs={latency}
                 source="manual"
-                canSimulate={!!signalId && signal !== null && signal.direction !== "WAIT" && !openTradeForCard}
+                canSimulate={
+                  !!signalId && signal !== null && signal.direction !== "WAIT" && (trades?.open.length ?? 0) === 0
+                }
                 simulating={!!signalId && simulatingId === signalId}
                 notional={notional}
                 onNotionalChange={setNotional}
                 onSimulate={signalId ? () => void simulateTrade(signalId) : undefined}
                 openTradeHint={
-                  openTradeForCard
-                    ? `Paper position already open for ${cardSymbol} — close it before simulating another.`
+                  (trades?.open.length ?? 0) > 0
+                    ? `Single-position mode — ${trades?.open[0]?.symbol ?? "a trade"} is still open. Close it before simulating another.`
                     : null
                 }
               />
@@ -882,15 +1020,15 @@ export function SignalsPanel() {
         </Card>
       </div>
 
-      {/* auto scan */}
+      {/* automation: scan loop + auto-trade engine */}
       <Card>
         <CardHeader className="pb-2">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <CardTitle className="flex items-center gap-2 text-base">
               <Timer className="size-4 text-amber-500" aria-hidden />
-              Auto-scan loop
+              Automation
               <span className="text-xs font-normal text-muted-foreground">
-                periodically feeds fresh bars to the model
+                scan loop · auto-trade engine (R:R + confidence gated)
               </span>
             </CardTitle>
             <div className="flex items-center gap-2">
@@ -899,8 +1037,79 @@ export function SignalsPanel() {
             </div>
           </div>
         </CardHeader>
-        <CardContent className="grid gap-4 md:grid-cols-2">
-          <div className="space-y-3">
+        <CardContent className="space-y-4">
+          {/* auto-trade engine */}
+          <div
+            className={`space-y-3 rounded-xl border p-3 transition-colors ${
+              autoTradeOn
+                ? "border-amber-400/70 bg-amber-50/60 dark:border-amber-700 dark:bg-amber-950/20"
+                : ""
+            }`}
+          >
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div className="min-w-0">
+                <p className="flex flex-wrap items-center gap-1.5 text-sm font-semibold">
+                  <Bot className="size-4 text-amber-500" aria-hidden />
+                  Auto-trade engine
+                  <span
+                    className={`rounded-full border px-1.5 py-px text-[10px] font-bold ${
+                      autoTradeOn
+                        ? "border-emerald-300 bg-emerald-100 text-emerald-700 dark:border-emerald-700 dark:bg-emerald-950 dark:text-emerald-400"
+                        : "border-border text-muted-foreground"
+                    }`}
+                  >
+                    {autoTradeOn ? "ARMED" : "OFF"}
+                  </span>
+                </p>
+                <p className="mt-0.5 max-w-xl text-[11px] leading-relaxed text-muted-foreground">
+                  Scan signals that clear both gates open a paper trade automatically at the live price —
+                  confidence ≥ {minConfidence}% and R:R ≥ {minRR.toFixed(1)}, and only while the account is
+                  flat (one trade at a time). Manual analyses always wait for your click.
+                </p>
+              </div>
+              <Switch
+                checked={autoTradeOn}
+                onCheckedChange={toggleAutoTrade}
+                aria-label="Toggle auto-trade engine"
+              />
+            </div>
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-muted-foreground">Min confidence</span>
+                  <span className="font-mono font-semibold tabular-nums">{minConfidence}%</span>
+                </div>
+                <Slider
+                  value={[minConfidence]}
+                  min={50}
+                  max={95}
+                  step={1}
+                  onValueChange={(vals) => setMinConfidence(vals[0] ?? minConfidence)}
+                  aria-label="Minimum confidence for auto-trade"
+                />
+              </div>
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-muted-foreground">Min reward : risk</span>
+                  <span className="font-mono font-semibold tabular-nums">{minRR.toFixed(1)}</span>
+                </div>
+                <Slider
+                  value={[minRR]}
+                  min={1}
+                  max={3}
+                  step={0.1}
+                  onValueChange={(vals) => setMinRR(vals[0] ?? minRR)}
+                  aria-label="Minimum reward-to-risk ratio for auto-trade"
+                />
+              </div>
+            </div>
+            <p className="text-[11px] text-muted-foreground">
+              Position size: {notional.toLocaleString()} USDT — the size picker in the signal card.
+            </p>
+          </div>
+
+          <div className="grid gap-4 md:grid-cols-2">
+            <div className="space-y-3">
             <div className="flex flex-wrap items-center gap-2">
               <p className="text-xs font-medium text-muted-foreground">Every</p>
               <div className="flex rounded-lg border p-0.5" role="group" aria-label="Scan interval">
@@ -925,9 +1134,14 @@ export function SignalsPanel() {
                 variant="outline"
                 className="h-8 gap-1.5"
                 onClick={() => void runScan()}
-                disabled={runningRef.current}
+                disabled={scanning}
               >
-                <Play className="size-3.5" aria-hidden /> Run now
+                {scanning ? (
+                  <Loader2 className="size-3.5 animate-spin" aria-hidden />
+                ) : (
+                  <Play className="size-3.5" aria-hidden />
+                )}
+                {scanning ? "Scanning…" : "Run now"}
               </Button>
             </div>
             <div>
@@ -952,30 +1166,67 @@ export function SignalsPanel() {
               </div>
             </div>
           </div>
-          <div className="space-y-2 rounded-xl border bg-muted/30 p-3">
-            {scanProgress ? (
-              <p className="flex items-center gap-2 text-sm font-medium">
-                <Loader2 className="size-4 animate-spin text-amber-500" aria-hidden />
-                {scanProgress}
-              </p>
-            ) : autoOn && countdown ? (
-              <>
-                <div className="flex items-center justify-between text-sm">
-                  <span className="text-muted-foreground">Next scan in</span>
-                  <span className="font-mono text-lg font-bold tabular-nums">{countdown}</span>
+            <div className="space-y-3">
+              <div className="space-y-2 rounded-xl border bg-muted/30 p-3">
+                {scanProgress ? (
+                  <p className="flex items-center gap-2 text-sm font-medium">
+                    <Loader2 className="size-4 animate-spin text-amber-500" aria-hidden />
+                    {scanProgress}
+                  </p>
+                ) : autoOn && countdown ? (
+                  <>
+                    <div className="flex items-center justify-between text-sm">
+                      <span className="text-muted-foreground">Next scan in</span>
+                      <span className="font-mono text-lg font-bold tabular-nums">{countdown}</span>
+                    </div>
+                    <Progress value={countdownPct} className="h-1.5" aria-label="Time until next scan" />
+                  </>
+                ) : (
+                  <p className="text-sm text-muted-foreground">
+                    Turn the loop on and the terminal will fetch fresh bars for each selected symbol every{" "}
+                    {scanMinutes} minutes, ask the model for BUY / SELL / WAIT verdicts with entry, SL and TP,
+                    and file every result into the feed below.
+                  </p>
+                )}
+                <p className="text-[11px] text-muted-foreground">
+                  Results persist to the database and appear in the feed even while you&apos;re on another tab.
+                </p>
+              </div>
+
+              {autoLog.length > 0 && (
+                <div className="rounded-xl border p-3">
+                  <p className="mb-1.5 flex items-center gap-1.5 text-xs font-semibold">
+                    <Bot className="size-3.5 text-amber-500" aria-hidden /> Auto-trade log
+                  </p>
+                  <div
+                    className="custom-scrollbar max-h-44 space-y-1 overflow-y-auto pr-1"
+                    aria-live="polite"
+                    aria-label="Auto-trade decisions"
+                  >
+                    {autoLog.map((e) => (
+                      <p key={e.id} className="flex items-start gap-1.5 text-[11px] leading-snug">
+                        <span
+                          className={`mt-1 size-1.5 shrink-0 rounded-full ${
+                            e.kind === "opened"
+                              ? "bg-emerald-500"
+                              : e.kind === "error"
+                                ? "bg-rose-500"
+                                : "bg-zinc-400"
+                          }`}
+                          aria-hidden
+                        />
+                        <span className="shrink-0 font-mono text-[10px] tabular-nums text-muted-foreground">
+                          {new Date(e.ts).toLocaleTimeString([], { hour12: false })}
+                        </span>
+                        <span className={e.kind === "opened" ? "font-medium" : "text-muted-foreground"}>
+                          {e.text}
+                        </span>
+                      </p>
+                    ))}
+                  </div>
                 </div>
-                <Progress value={countdownPct} className="h-1.5" aria-label="Time until next scan" />
-              </>
-            ) : (
-              <p className="text-sm text-muted-foreground">
-                Turn the loop on and the terminal will fetch fresh bars for each selected symbol every{" "}
-                {scanMinutes} minutes, ask the model for BUY / SELL / WAIT verdicts with entry, SL and TP,
-                and file every result into the feed below.
-              </p>
-            )}
-            <p className="text-[11px] text-muted-foreground">
-              Results persist to the database and appear in the feed even while you&apos;re on another tab.
-            </p>
+              )}
+            </div>
           </div>
         </CardContent>
       </Card>
@@ -1135,11 +1386,11 @@ export function SignalsPanel() {
                               variant="ghost"
                               className="h-7 gap-1 text-[11px] font-semibold text-emerald-700 hover:text-emerald-600 dark:text-emerald-500 dark:hover:text-emerald-400"
                               disabled={
-                                simulatingId === s.id || !!trades?.open.some((t) => t.symbol === s.symbol)
+                                simulatingId === s.id || (trades?.open.length ?? 0) > 0
                               }
                               title={
-                                trades?.open.some((t) => t.symbol === s.symbol)
-                                  ? "A paper position is already open for this symbol"
+                                (trades?.open.length ?? 0) > 0
+                                  ? "Single-position mode — close the open trade before simulating another"
                                   : `Simulate a ${s.direction === "BUY" ? "long" : "short"} trade of ${notional} USDT`
                               }
                               onClick={() => void simulateTrade(s.id)}
