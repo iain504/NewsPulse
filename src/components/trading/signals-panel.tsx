@@ -1,0 +1,880 @@
+"use client";
+
+import * as React from "react";
+import {
+  Activity,
+  ChevronDown,
+  ChevronRight,
+  Crosshair,
+  Loader2,
+  Play,
+  Plus,
+  Radio,
+  RefreshCw,
+  Timer,
+  Trash2,
+  X,
+  Zap,
+} from "lucide-react";
+import { toast } from "sonner";
+
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Progress } from "@/components/ui/progress";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
+import { CandleChart } from "@/components/trading/candle-chart";
+import { SignalCard, type SignalStatus } from "@/components/trading/signal-card";
+import { fetchJSON, postSSE } from "@/lib/sse-client";
+import { formatCompact, formatPct, formatPrice, timeAgo } from "@/lib/format";
+import {
+  DEFAULT_SYMBOLS,
+  RISK_PROFILES,
+  SCAN_INTERVALS,
+  SIGNAL_META,
+  TIMEFRAMES,
+  type CandleRow,
+  type MarketSnapshot,
+  type SignalDirection,
+  type SignalRow,
+  type StructuredSignal,
+  type TickerRow,
+  type Timeframe,
+} from "@/lib/types";
+
+const SYMBOL_RE = /^[A-Z0-9]{5,15}$/;
+
+interface SnapshotEvent {
+  snapshot: MarketSnapshot;
+}
+interface SignalEvent {
+  signal: StructuredSignal;
+  latencyMs: number;
+  model: string;
+}
+interface ErrorEvent {
+  message: string;
+}
+
+export function SignalsPanel() {
+  // ---- market state ----
+  const [symbol, setSymbol] = React.useState("BTCUSDT");
+  const [timeframe, setTimeframe] = React.useState<Timeframe>("15m");
+  const [candles, setCandles] = React.useState<CandleRow[]>([]);
+  const [ticker, setTicker] = React.useState<TickerRow | null>(null);
+  const [quotes, setQuotes] = React.useState<Record<string, TickerRow>>({});
+  const [chartLoading, setChartLoading] = React.useState(true);
+  const [chartError, setChartError] = React.useState<string | null>(null);
+  const [watchlist, setWatchlist] = React.useState<string[]>([...DEFAULT_SYMBOLS]);
+  const [customSymbol, setCustomSymbol] = React.useState("");
+
+  // ---- analysis state ----
+  const [model, setModel] = React.useState("edge0-35b");
+  const [riskProfile, setRiskProfile] = React.useState("balanced");
+  const [status, setStatus] = React.useState<SignalStatus>("idle");
+  const [snapshot, setSnapshot] = React.useState<MarketSnapshot | null>(null);
+  const [signal, setSignal] = React.useState<StructuredSignal | null>(null);
+  const [rationale, setRationale] = React.useState("");
+  const [streaming, setStreaming] = React.useState(false);
+  const [analysisError, setAnalysisError] = React.useState<string | null>(null);
+  const [latency, setLatency] = React.useState(0);
+  const [analyzedKey, setAnalyzedKey] = React.useState("");
+
+  // ---- auto scan ----
+  const [autoOn, setAutoOn] = React.useState(false);
+  const [scanMinutes, setScanMinutes] = React.useState<number>(15);
+  const [scanSymbols, setScanSymbols] = React.useState<string[]>(["BTCUSDT", "ETHUSDT", "SOLUSDT"]);
+  const [nextScanAt, setNextScanAt] = React.useState<number | null>(null);
+  const [nowTick, setNowTick] = React.useState(Date.now());
+  const [scanProgress, setScanProgress] = React.useState<string | null>(null);
+  const runningRef = React.useRef(false);
+
+  // ---- feed ----
+  const [feed, setFeed] = React.useState<SignalRow[]>([]);
+  const [feedLoading, setFeedLoading] = React.useState(true);
+  const [feedFilter, setFeedFilter] = React.useState("all");
+  const [expandedId, setExpandedId] = React.useState<string | null>(null);
+
+  const refreshFeed = React.useCallback(async () => {
+    try {
+      const res = await fetchJSON<{ ok: boolean; signals: SignalRow[] }>("/api/signals?limit=40");
+      setFeed(res.signals);
+    } catch {
+      // feed is non-critical
+    } finally {
+      setFeedLoading(false);
+    }
+  }, []);
+
+  React.useEffect(() => {
+    void refreshFeed();
+  }, [refreshFeed]);
+
+  // restore auto-scan preferences
+  React.useEffect(() => {
+    try {
+      const saved = localStorage.getItem("np.scan");
+      if (!saved) return;
+      const cfg = JSON.parse(saved) as { minutes?: number; symbols?: string[] };
+      if (cfg.minutes && (SCAN_INTERVALS as readonly number[]).includes(cfg.minutes)) {
+        setScanMinutes(cfg.minutes);
+      }
+      if (Array.isArray(cfg.symbols)) {
+        setScanSymbols(cfg.symbols.filter((s) => SYMBOL_RE.test(s)).slice(0, 12));
+      }
+    } catch {
+      // ignore malformed storage
+    }
+  }, []);
+
+  React.useEffect(() => {
+    localStorage.setItem("np.scan", JSON.stringify({ minutes: scanMinutes, symbols: scanSymbols }));
+  }, [scanMinutes, scanSymbols]);
+
+  // ---- chart data (30s refresh) ----
+  const loadChart = React.useCallback(async () => {
+    setChartLoading(true);
+    setChartError(null);
+    try {
+      const res = await fetchJSON<{ ok: boolean; candles: CandleRow[]; ticker: TickerRow | null }>(
+        `/api/market/klines?symbol=${encodeURIComponent(symbol)}&interval=${timeframe}&limit=150`,
+      );
+      setCandles(res.candles);
+      setTicker(res.ticker);
+    } catch (err) {
+      setChartError(err instanceof Error ? err.message : "Failed to load chart data.");
+    } finally {
+      setChartLoading(false);
+    }
+  }, [symbol, timeframe]);
+
+  React.useEffect(() => {
+    void loadChart();
+    const iv = setInterval(() => {
+      if (document.visibilityState === "visible") void loadChart();
+    }, 30_000);
+    return () => clearInterval(iv);
+  }, [loadChart]);
+
+  // ---- watchlist quotes (12s refresh) ----
+  const loadQuotes = React.useCallback(async () => {
+    if (watchlist.length === 0) return;
+    try {
+      const res = await fetchJSON<{ ok: boolean; tickers: TickerRow[] }>(
+        `/api/market/quote?symbols=${encodeURIComponent(watchlist.join(","))}`,
+      );
+      const map: Record<string, TickerRow> = {};
+      for (const t of res.tickers) map[t.symbol] = t;
+      setQuotes(map);
+    } catch {
+      // keep last quotes
+    }
+  }, [watchlist]);
+
+  React.useEffect(() => {
+    void loadQuotes();
+    const iv = setInterval(loadQuotes, 12_000);
+    return () => clearInterval(iv);
+  }, [loadQuotes]);
+
+  // ---- SSE analysis ----
+  const analyzeSymbol = React.useCallback(
+    async (sym: string, source: "manual" | "auto", silent: boolean): Promise<void> => {
+      if (!silent) {
+        setStatus("fetching");
+        setSignal(null);
+        setRationale("");
+        setStreaming(false);
+        setAnalysisError(null);
+        setLatency(0);
+      }
+      let errored = false;
+      let errorMessage = "";
+      try {
+        await postSSE(
+          "/api/signals/analyze",
+          { symbol: sym, interval: timeframe, model, riskProfile, source },
+          {
+            onEvent: (event, data) => {
+              if (event === "snapshot") {
+                if (!silent) {
+                  setSnapshot((data as SnapshotEvent).snapshot);
+                  setStatus("thinking");
+                }
+              } else if (event === "signal") {
+                if (!silent) {
+                  setSignal((data as SignalEvent).signal);
+                  setLatency((data as SignalEvent).latencyMs);
+                  setStatus("ready");
+                  setAnalyzedKey(`${sym}|${timeframe}`);
+                }
+              } else if (event === "delta") {
+                if (!silent) {
+                  setStreaming(true);
+                  setRationale((r) => r + (data as { t: string }).t);
+                }
+              } else if (event === "done") {
+                if (!silent) setStreaming(false);
+                void refreshFeed();
+              } else if (event === "error") {
+                errored = true;
+                errorMessage = (data as ErrorEvent).message;
+                if (!silent) {
+                  setAnalysisError(errorMessage);
+                  setStatus("error");
+                  setStreaming(false);
+                }
+              }
+            },
+            onError: (err) => {
+              errored = true;
+              errorMessage = err.message;
+              if (!silent) {
+                setAnalysisError(err.message);
+                setStatus("error");
+              }
+            },
+          },
+        );
+      } catch (err) {
+        errored = true;
+        errorMessage = err instanceof Error ? err.message : "Request failed";
+        if (!silent) {
+          setAnalysisError(errorMessage);
+          setStatus("error");
+        }
+      }
+      if (errored) throw new Error(errorMessage || `${sym}: analysis failed`);
+    },
+    [timeframe, model, riskProfile, refreshFeed],
+  );
+
+  const analyzeNow = React.useCallback(async () => {
+    try {
+      await analyzeSymbol(symbol, "manual", false);
+    } catch {
+      // error already reflected in the card
+    }
+  }, [analyzeSymbol, symbol]);
+
+  // ---- auto-scan loop ----
+  const runScan = React.useCallback(async () => {
+    if (runningRef.current) return;
+    const list = scanSymbols.length > 0 ? scanSymbols : [symbol];
+    runningRef.current = true;
+    try {
+      for (let i = 0; i < list.length; i++) {
+        const sym = list[i];
+        setScanProgress(`Analyzing ${sym} (${i + 1}/${list.length})…`);
+        try {
+          await analyzeSymbol(sym, "auto", true);
+        } catch (err) {
+          toast.error(`${sym} — ${err instanceof Error ? err.message : "scan failed"}`);
+        }
+      }
+      toast.success(`Auto-scan complete — ${list.length} symbol${list.length === 1 ? "" : "s"} checked.`);
+    } finally {
+      runningRef.current = false;
+      setScanProgress(null);
+      setNextScanAt(Date.now() + scanMinutes * 60_000);
+    }
+  }, [scanSymbols, symbol, scanMinutes, analyzeSymbol]);
+
+  React.useEffect(() => {
+    if (!autoOn) return;
+    setNowTick(Date.now());
+    const iv = setInterval(() => setNowTick(Date.now()), 1000);
+    return () => clearInterval(iv);
+  }, [autoOn]);
+
+  React.useEffect(() => {
+    if (!autoOn) return;
+    if (nextScanAt === null) {
+      setNextScanAt(Date.now() + scanMinutes * 60_000);
+      return;
+    }
+    if (nowTick >= nextScanAt && !runningRef.current) {
+      void runScan();
+    }
+  }, [autoOn, nowTick, nextScanAt, scanMinutes, runScan]);
+
+  const toggleAuto = (on: boolean) => {
+    setAutoOn(on);
+    if (on) {
+      setNextScanAt(Date.now() + scanMinutes * 60_000);
+      toast.info(`Auto-scan armed — every ${scanMinutes} min across ${scanSymbols.length || 1} symbol(s).`);
+    } else {
+      setNextScanAt(null);
+    }
+  };
+
+  // ---- watchlist management ----
+  const addSymbol = async () => {
+    const s = customSymbol.trim().toUpperCase();
+    if (!SYMBOL_RE.test(s)) {
+      toast.error("Invalid symbol format — try e.g. LINKUSDT.");
+      return;
+    }
+    if (watchlist.includes(s)) {
+      toast.info(`${s} is already on the watchlist.`);
+      setCustomSymbol("");
+      return;
+    }
+    try {
+      await fetchJSON(`/api/market/klines?symbol=${encodeURIComponent(s)}&interval=15m&limit=60`);
+      setWatchlist((w) => [...w, s].slice(0, 12));
+      setCustomSymbol("");
+      toast.success(`${s} added to the watchlist.`);
+    } catch (err) {
+      toast.error(`${s} not found on Binance — ${err instanceof Error ? err.message : "check the ticker"}`);
+    }
+  };
+
+  const removeSymbol = (s: string) => {
+    const next = watchlist.filter((x) => x !== s);
+    setWatchlist(next);
+    setScanSymbols((prev) => prev.filter((x) => x !== s));
+    if (s === symbol && next.length > 0) setSymbol(next[0]);
+  };
+
+  // ---- feed actions ----
+  const deleteSignal = async (id: string) => {
+    try {
+      await fetchJSON(`/api/signals?id=${encodeURIComponent(id)}`, { method: "DELETE" });
+      setFeed((f) => f.filter((x) => x.id !== id));
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Delete failed");
+    }
+  };
+
+  const clearAllSignals = async () => {
+    if (!window.confirm("Delete all saved signals?")) return;
+    try {
+      await fetchJSON("/api/signals?all=1", { method: "DELETE" });
+      setFeed([]);
+      toast.success("Signal history cleared.");
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Clear failed");
+    }
+  };
+
+  // ---- derived ----
+  const pending = status === "fetching" || status === "thinking";
+  const chartLevels =
+    signal && analyzedKey === `${symbol}|${timeframe}` && signal.direction !== "WAIT"
+      ? {
+          direction: signal.direction,
+          entry: signal.entry,
+          entryLow: signal.entryLow,
+          entryHigh: signal.entryHigh,
+          stopLoss: signal.stopLoss,
+          takeProfit: signal.takeProfit,
+        }
+      : null;
+
+  const remainingMs = nextScanAt !== null ? Math.max(0, nextScanAt - nowTick) : null;
+  const countdown =
+    remainingMs !== null
+      ? `${Math.floor(remainingMs / 60000)}:${Math.floor((remainingMs % 60000) / 1000)
+          .toString()
+          .padStart(2, "0")}`
+      : null;
+  const countdownPct =
+    remainingMs !== null ? Math.max(0, Math.min(100, (1 - remainingMs / (scanMinutes * 60000)) * 100)) : 0;
+
+  const filteredFeed = feedFilter === "all" ? feed : feed.filter((s) => s.symbol === feedFilter);
+  const counts = feed.reduce(
+    (acc, s) => {
+      acc[s.direction] = (acc[s.direction] ?? 0) + 1;
+      return acc;
+    },
+    {} as Record<string, number>,
+  );
+  const snapMatches = snapshot && analyzedKey === `${symbol}|${timeframe}` ? snapshot : null;
+
+  return (
+    <div className="space-y-5">
+      {/* intro */}
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <h2 className="flex items-center gap-2 text-lg font-bold">
+            <Activity className="size-5 text-amber-500" aria-hidden />
+            Trading Signal Terminal
+          </h2>
+          <p className="mt-0.5 text-sm text-muted-foreground">
+            Live Binance spot bars → deterministic indicators → Edge0 verdict with entry, stop-loss &amp; take-profit.
+          </p>
+        </div>
+        <Badge variant="outline" className="border-amber-300 bg-amber-50 text-[11px] text-amber-800 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-300">
+          Educational study tool — not financial advice
+        </Badge>
+      </div>
+
+      {/* watchlist strip */}
+      <div className="space-y-2">
+        <div className="flex items-center justify-between">
+          <p className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+            <Radio className="size-3.5" aria-hidden /> Watchlist · live 24h
+          </p>
+          <div className="flex items-center gap-1.5">
+            <Input
+              value={customSymbol}
+              onChange={(e) => setCustomSymbol(e.target.value.toUpperCase())}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") void addSymbol();
+              }}
+              placeholder="Add e.g. LINKUSDT"
+              className="h-8 w-40 text-xs"
+              aria-label="Add symbol to watchlist"
+            />
+            <Button size="sm" variant="outline" className="h-8 gap-1 px-2" onClick={() => void addSymbol()}>
+              <Plus className="size-3.5" aria-hidden /> Add
+            </Button>
+          </div>
+        </div>
+        <div className="custom-scrollbar flex gap-2 overflow-x-auto pb-1">
+          {watchlist.map((sym) => {
+            const q = quotes[sym];
+            const active = sym === symbol;
+            const up = (q?.priceChangePercent ?? 0) >= 0;
+            return (
+              <div key={sym} className="relative shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setSymbol(sym)}
+                  className={`w-32 rounded-xl border p-2.5 text-left transition-colors ${
+                    active
+                      ? "border-amber-500 bg-amber-500/10"
+                      : "border-border bg-card hover:border-amber-400/60 hover:bg-muted/50"
+                  }`}
+                  aria-pressed={active}
+                  aria-label={`Show ${sym} chart`}
+                >
+                  <p className="flex items-center gap-1 text-xs font-bold">
+                    {sym.replace("USDT", "")}
+                    <span className="text-[9px] font-medium text-muted-foreground">/USDT</span>
+                    {q && (
+                      <span className={`ml-auto text-[10px] font-semibold ${up ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
+                        {formatPct(q.priceChangePercent)}
+                      </span>
+                    )}
+                  </p>
+                  <p className="mt-1 font-mono text-sm font-semibold tabular-nums">
+                    {q ? formatPrice(q.lastPrice) : <span className="text-muted-foreground">…</span>}
+                  </p>
+                  <p className="text-[10px] text-muted-foreground">
+                    {q ? `Vol ${formatCompact(q.quoteVolume)}` : "loading"}
+                  </p>
+                </button>
+                {watchlist.length > 1 && (
+                  <button
+                    type="button"
+                    onClick={() => removeSymbol(sym)}
+                    className="absolute -right-1.5 -top-1.5 hidden rounded-full border bg-background p-0.5 text-muted-foreground hover:text-rose-500 sm:block"
+                    aria-label={`Remove ${sym} from watchlist`}
+                  >
+                    <X className="size-3" aria-hidden />
+                  </button>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* chart + engine */}
+      <div className="grid gap-4 lg:grid-cols-5">
+        {/* chart card */}
+        <Card className="lg:col-span-3">
+          <CardHeader className="pb-2">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <CardTitle className="flex items-center gap-2 text-base">
+                <span className="font-mono">{symbol}</span>
+                <span className="text-sm font-normal text-muted-foreground">· Binance spot</span>
+                {ticker && (
+                  <span className={`text-sm font-bold ${ticker.priceChangePercent >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400"}`}>
+                    {formatPrice(ticker.lastPrice)}{" "}
+                    <span className="text-xs font-semibold">{formatPct(ticker.priceChangePercent)}</span>
+                  </span>
+                )}
+              </CardTitle>
+              <div className="flex items-center gap-1">
+                <div className="flex rounded-lg border p-0.5" role="group" aria-label="Chart timeframe">
+                  {TIMEFRAMES.map((tf) => (
+                    <button
+                      key={tf}
+                      type="button"
+                      onClick={() => setTimeframe(tf)}
+                      className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
+                        timeframe === tf
+                          ? "bg-zinc-900 text-amber-300 dark:bg-amber-500 dark:text-zinc-950"
+                          : "text-muted-foreground hover:bg-muted"
+                      }`}
+                      aria-pressed={timeframe === tf}
+                    >
+                      {tf}
+                    </button>
+                  ))}
+                </div>
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  className="size-8"
+                  onClick={() => void loadChart()}
+                  aria-label="Refresh chart"
+                >
+                  <RefreshCw className={`size-4 ${chartLoading ? "animate-spin" : ""}`} aria-hidden />
+                </Button>
+              </div>
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-2">
+            {chartError ? (
+              <div className="flex h-64 flex-col items-center justify-center gap-2 text-center">
+                <p className="text-sm font-medium text-rose-600 dark:text-rose-400">{chartError}</p>
+                <Button size="sm" variant="outline" onClick={() => void loadChart()}>
+                  Retry
+                </Button>
+              </div>
+            ) : chartLoading && candles.length === 0 ? (
+              <div className="space-y-2">
+                <div className="h-72 animate-pulse rounded-lg bg-muted" />
+                <div className="h-4 w-2/3 animate-pulse rounded bg-muted" />
+              </div>
+            ) : (
+              <CandleChart candles={candles} interval={timeframe} levels={chartLevels} />
+            )}
+            <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
+              {ticker && (
+                <>
+                  <span>24h high {formatPrice(ticker.highPrice)}</span>
+                  <span>24h low {formatPrice(ticker.lowPrice)}</span>
+                  <span>24h vol {formatCompact(ticker.quoteVolume)}</span>
+                </>
+              )}
+              {snapMatches && (
+                <>
+                  <span className="text-amber-600 dark:text-amber-400">RSI {snapMatches.rsi14.toFixed(1)}</span>
+                  <span>ATR {formatPrice(snapMatches.atr14)} ({snapMatches.atrPct.toFixed(2)}%)</span>
+                  <span className="truncate">{snapMatches.trendLabel}</span>
+                </>
+              )}
+              {chartLevels && <span className="font-semibold text-amber-600 dark:text-amber-400">dashed lines = last signal levels</span>}
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* engine card */}
+        <Card className="lg:col-span-2">
+          <CardHeader className="pb-2">
+            <CardTitle className="flex items-center gap-2 text-base">
+              <Crosshair className="size-4 text-amber-500" aria-hidden />
+              Signal engine
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <div className="grid grid-cols-2 gap-2">
+              <div className="space-y-1">
+                <p className="text-[11px] font-medium text-muted-foreground">Model</p>
+                <Select value={model} onValueChange={setModel}>
+                  <SelectTrigger className="h-8 text-xs" aria-label="Analysis model">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="edge0-35b">edge0-35b · deep</SelectItem>
+                    <SelectItem value="edge0-8b">edge0-8b · fast</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-1">
+                <p className="text-[11px] font-medium text-muted-foreground">Risk profile</p>
+                <Select value={riskProfile} onValueChange={setRiskProfile}>
+                  <SelectTrigger className="h-8 text-xs" aria-label="Risk profile">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {RISK_PROFILES.map((r) => (
+                      <SelectItem key={r.value} value={r.value}>
+                        {r.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+            <p className="text-[11px] text-muted-foreground">
+              {RISK_PROFILES.find((r) => r.value === riskProfile)?.hint}
+            </p>
+            <Button
+              onClick={() => void analyzeNow()}
+              disabled={pending}
+              className="w-full gap-2 bg-zinc-900 font-semibold text-amber-300 hover:bg-zinc-800 dark:bg-amber-500 dark:text-zinc-950 dark:hover:bg-amber-400"
+            >
+              {pending ? (
+                <>
+                  <Loader2 className="size-4 animate-spin" aria-hidden />
+                  {status === "fetching" ? "Fetching bars…" : "Model reasoning…"}
+                </>
+              ) : (
+                <>
+                  <Zap className="size-4" aria-hidden />
+                  Analyze {symbol} now
+                </>
+              )}
+            </Button>
+            <div className="custom-scrollbar max-h-[540px] overflow-y-auto pr-1">
+              <SignalCard
+                status={status}
+                symbol={symbol}
+                interval={timeframe}
+                signal={signal}
+                snapshot={snapshot}
+                rationale={rationale}
+                streaming={streaming}
+                error={analysisError}
+                model={model}
+                latencyMs={latency}
+                source="manual"
+              />
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+
+      {/* auto scan */}
+      <Card>
+        <CardHeader className="pb-2">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <CardTitle className="flex items-center gap-2 text-base">
+              <Timer className="size-4 text-amber-500" aria-hidden />
+              Auto-scan loop
+              <span className="text-xs font-normal text-muted-foreground">
+                periodically feeds fresh bars to the model
+              </span>
+            </CardTitle>
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-muted-foreground">{autoOn ? "On" : "Off"}</span>
+              <Switch checked={autoOn} onCheckedChange={toggleAuto} aria-label="Toggle auto-scan" />
+            </div>
+          </div>
+        </CardHeader>
+        <CardContent className="grid gap-4 md:grid-cols-2">
+          <div className="space-y-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <p className="text-xs font-medium text-muted-foreground">Every</p>
+              <div className="flex rounded-lg border p-0.5" role="group" aria-label="Scan interval">
+                {SCAN_INTERVALS.map((m) => (
+                  <button
+                    key={m}
+                    type="button"
+                    onClick={() => setScanMinutes(m)}
+                    className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
+                      scanMinutes === m
+                        ? "bg-zinc-900 text-amber-300 dark:bg-amber-500 dark:text-zinc-950"
+                        : "text-muted-foreground hover:bg-muted"
+                    }`}
+                    aria-pressed={scanMinutes === m}
+                  >
+                    {m}m
+                  </button>
+                ))}
+              </div>
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-8 gap-1.5"
+                onClick={() => void runScan()}
+                disabled={runningRef.current}
+              >
+                <Play className="size-3.5" aria-hidden /> Run now
+              </Button>
+            </div>
+            <div>
+              <p className="mb-1.5 text-xs font-medium text-muted-foreground">Symbols in the loop</p>
+              <div className="flex flex-wrap gap-1.5">
+                {watchlist.map((sym) => {
+                  const on = scanSymbols.includes(sym);
+                  return (
+                    <button
+                      key={sym}
+                      type="button"
+                      onClick={() =>
+                        setScanSymbols((prev) => (on ? prev.filter((x) => x !== sym) : [...prev, sym]))
+                      }
+                      className={`rounded-full border px-2.5 py-1 font-mono text-[11px] font-semibold transition-colors ${
+                        on
+                          ? "border-amber-500 bg-amber-500/15 text-amber-700 dark:text-amber-400"
+                          : "border-border text-muted-foreground hover:bg-muted"
+                      }`}
+                      aria-pressed={on}
+                    >
+                      {sym}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+          <div className="space-y-2 rounded-xl border bg-muted/30 p-3">
+            {scanProgress ? (
+              <p className="flex items-center gap-2 text-sm font-medium">
+                <Loader2 className="size-4 animate-spin text-amber-500" aria-hidden />
+                {scanProgress}
+              </p>
+            ) : autoOn && countdown ? (
+              <>
+                <div className="flex items-center justify-between text-sm">
+                  <span className="text-muted-foreground">Next scan in</span>
+                  <span className="font-mono text-lg font-bold tabular-nums">{countdown}</span>
+                </div>
+                <Progress value={countdownPct} className="h-1.5" aria-label="Time until next scan" />
+              </>
+            ) : (
+              <p className="text-sm text-muted-foreground">
+                Turn the loop on and the terminal will fetch fresh bars for each selected symbol every{" "}
+                {scanMinutes} minutes, ask the model for BUY / SELL / WAIT verdicts with entry, SL and TP,
+                and file every result into the feed below.
+              </p>
+            )}
+            <p className="text-[11px] text-muted-foreground">
+              Results persist to the database and appear in the feed even while you&apos;re on another tab.
+            </p>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* feed */}
+      <Card>
+        <CardHeader className="pb-2">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <CardTitle className="flex items-center gap-2 text-base">
+              Signal feed
+              <span className="flex gap-1.5 text-xs font-normal">
+                {counts.BUY ? (
+                  <span className="rounded-full bg-emerald-100 px-2 py-0.5 font-semibold text-emerald-700 dark:bg-emerald-950 dark:text-emerald-400">
+                    {counts.BUY} buy
+                  </span>
+                ) : null}
+                {counts.SELL ? (
+                  <span className="rounded-full bg-rose-100 px-2 py-0.5 font-semibold text-rose-700 dark:bg-rose-950 dark:text-rose-400">
+                    {counts.SELL} sell
+                  </span>
+                ) : null}
+                {counts.WAIT ? (
+                  <span className="rounded-full bg-zinc-100 px-2 py-0.5 font-semibold text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400">
+                    {counts.WAIT} wait
+                  </span>
+                ) : null}
+              </span>
+            </CardTitle>
+            <div className="flex items-center gap-2">
+              <Select value={feedFilter} onValueChange={setFeedFilter}>
+                <SelectTrigger className="h-8 w-36 text-xs" aria-label="Filter feed by symbol">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">All symbols</SelectItem>
+                  {watchlist.map((s) => (
+                    <SelectItem key={s} value={s}>
+                      {s}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <Button size="sm" variant="ghost" className="h-8 gap-1 text-muted-foreground hover:text-rose-500" onClick={() => void clearAllSignals()}>
+                <Trash2 className="size-3.5" aria-hidden /> Clear
+              </Button>
+            </div>
+          </div>
+        </CardHeader>
+        <CardContent>
+          {feedLoading ? (
+            <div className="space-y-2">
+              {[0, 1, 2].map((i) => (
+                <div key={i} className="h-12 animate-pulse rounded-lg bg-muted" />
+              ))}
+            </div>
+          ) : filteredFeed.length === 0 ? (
+            <p className="py-8 text-center text-sm text-muted-foreground">
+              No signals yet — analyze a symbol or arm the auto-scan loop.
+            </p>
+          ) : (
+            <div className="custom-scrollbar max-h-96 space-y-1.5 overflow-y-auto pr-1">
+              {filteredFeed.map((s) => {
+                const meta = SIGNAL_META[s.direction];
+                const open = expandedId === s.id;
+                return (
+                  <div key={s.id} className="rounded-lg border">
+                    <button
+                      type="button"
+                      className="flex w-full flex-wrap items-center gap-2 p-2.5 text-left hover:bg-muted/40"
+                      onClick={() => setExpandedId(open ? null : s.id)}
+                      aria-expanded={open}
+                    >
+                      {open ? (
+                        <ChevronDown className="size-4 shrink-0 text-muted-foreground" aria-hidden />
+                      ) : (
+                        <ChevronRight className="size-4 shrink-0 text-muted-foreground" aria-hidden />
+                      )}
+                      <span className={`inline-flex items-center rounded-md border px-2 py-0.5 text-[11px] font-bold ${meta.badge}`}>
+                        {s.direction}
+                      </span>
+                      <span className="font-mono text-xs font-semibold">{s.symbol}</span>
+                      <span className="text-[11px] text-muted-foreground">{s.interval}</span>
+                      <span className="hidden font-mono text-[11px] text-muted-foreground sm:inline">
+                        E {formatPrice(s.entry)} · SL {formatPrice(s.stopLoss)} · TP {formatPrice(s.takeProfit)}
+                      </span>
+                      <span className="ml-auto flex items-center gap-2 text-[11px] text-muted-foreground">
+                        <span className="font-semibold text-amber-600 dark:text-amber-400">R:R {s.rrRatio.toFixed(2)}</span>
+                        <span>{Math.round(s.confidence * 100)}%</span>
+                        <span className="hidden sm:inline">{s.source === "auto" ? "auto" : "manual"}</span>
+                        <span>{timeAgo(s.createdAt)}</span>
+                      </span>
+                    </button>
+                    {open && (
+                      <div className="space-y-2 border-t px-3 py-2.5">
+                        <p className="text-xs leading-relaxed">{s.summary}</p>
+                        {s.reasons.length > 0 && (
+                          <ul className="space-y-1">
+                            {s.reasons.map((r, i) => (
+                              <li key={i} className="text-[11px] leading-relaxed text-muted-foreground">
+                                · {r}
+                              </li>
+                            ))}
+                          </ul>
+                        )}
+                        {s.rationale && <p className="text-[11px] italic leading-relaxed text-muted-foreground">{s.rationale}</p>}
+                        <p className="text-[10px] text-muted-foreground">
+                          {s.model} · {(s.latencyMs / 1000).toFixed(1)}s · at {formatPrice(s.price)}
+                          {s.risks.length > 0 ? ` · risks: ${s.risks.join(" / ")}` : ""}
+                        </p>
+                        <div className="flex justify-end">
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            className="h-7 gap-1 text-[11px] text-muted-foreground hover:text-rose-500"
+                            onClick={() => void deleteSignal(s.id)}
+                          >
+                            <Trash2 className="size-3" aria-hidden /> Delete
+                          </Button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  );
+}

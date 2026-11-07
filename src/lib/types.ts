@@ -124,3 +124,142 @@ export const SENTIMENT_META: Record<
     hex: "#f59e0b",
   },
 };
+
+// ---------------------------------------------------------------------------
+// Trading signals (Binance bar data → LLM entry/SL/TP)
+// ---------------------------------------------------------------------------
+
+export type SignalDirection = "BUY" | "SELL" | "WAIT";
+
+export interface TickerRow {
+  symbol: string;
+  lastPrice: number;
+  priceChangePercent: number;
+  highPrice: number;
+  lowPrice: number;
+  quoteVolume: number;
+}
+
+export interface CandleRow {
+  openTime: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+  closeTime: number;
+  quoteVolume: number;
+  trades: number;
+}
+
+export interface MarketSnapshot {
+  symbol: string;
+  interval: string;
+  generatedAt: string;
+  lastPrice: number;
+  barCount: number;
+  lastBarOpenTime: number;
+  changePct24h: number;
+  high24h: number;
+  low24h: number;
+  quoteVolume24h: number;
+  ema9: number;
+  ema21: number;
+  ema50: number;
+  rsi14: number;
+  macd: { macd: number; signal: number; histogram: number };
+  atr14: number;
+  atrPct: number;
+  bb: { upper: number; mid: number; lower: number };
+  swingHigh: number;
+  swingLow: number;
+  volumeTrendPct: number;
+  trendLabel: string;
+  recentBars: { t: number; o: number; h: number; l: number; c: number; v: number }[];
+}
+
+export interface StructuredSignal {
+  direction: SignalDirection;
+  confidence: number;
+  entry: number;
+  entryLow: number;
+  entryHigh: number;
+  stopLoss: number;
+  takeProfit: number;
+  rrRatio: number;
+  timeHorizon: string;
+  summary: string;
+  reasons: string[];
+  risks: string[];
+}
+
+export interface SignalRow {
+  id: string;
+  symbol: string;
+  interval: string;
+  direction: SignalDirection;
+  confidence: number;
+  price: number;
+  entry: number;
+  entryLow: number;
+  entryHigh: number;
+  stopLoss: number;
+  takeProfit: number;
+  rrRatio: number;
+  timeHorizon: string;
+  summary: string;
+  reasons: string[];
+  risks: string[];
+  rationale: string;
+  model: string;
+  latencyMs: number;
+  source: string;
+  createdAt: string;
+}
+
+export type SignalStreamEvent =
+  | { event: "snapshot"; data: { snapshot: MarketSnapshot } }
+  | { event: "signal"; data: { signal: StructuredSignal; latencyMs: number; model: string } }
+  | { event: "delta"; data: { t: string } }
+  | { event: "done"; data: { id: string; createdAt: string; latencyMs: number } }
+  | { event: "error"; data: { message: string } };
+
+export const SIGNAL_META: Record<
+  SignalDirection,
+  { label: string; badge: string; text: string; bg: string; hex: string }
+> = {
+  BUY: {
+    label: "Buy / Long",
+    badge: "bg-emerald-100 text-emerald-800 border-emerald-300 dark:bg-emerald-950 dark:text-emerald-300 dark:border-emerald-800",
+    text: "text-emerald-600 dark:text-emerald-400",
+    bg: "bg-emerald-500",
+    hex: "#10b981",
+  },
+  SELL: {
+    label: "Sell / Short",
+    badge: "bg-rose-100 text-rose-800 border-rose-300 dark:bg-rose-950 dark:text-rose-300 dark:border-rose-800",
+    text: "text-rose-600 dark:text-rose-400",
+    bg: "bg-rose-500",
+    hex: "#f43f5e",
+  },
+  WAIT: {
+    label: "Wait",
+    badge: "bg-zinc-100 text-zinc-700 border-zinc-300 dark:bg-zinc-800 dark:text-zinc-300 dark:border-zinc-600",
+    text: "text-zinc-600 dark:text-zinc-400",
+    bg: "bg-zinc-400",
+    hex: "#a1a1aa",
+  },
+};
+
+export const TIMEFRAMES = ["5m", "15m", "1h", "4h", "1d"] as const;
+export type Timeframe = (typeof TIMEFRAMES)[number];
+
+export const RISK_PROFILES: { value: string; label: string; hint: string }[] = [
+  { value: "conservative", label: "Conservative", hint: "R:R ≥ 2.0 · confluence required" },
+  { value: "balanced", label: "Balanced", hint: "R:R ≥ 1.8 · standard setups" },
+  { value: "aggressive", label: "Aggressive", hint: "R:R ≥ 1.5 · early reversals" },
+];
+
+export const SCAN_INTERVALS = [5, 10, 15, 30] as const; // minutes
+
+export const DEFAULT_SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT"];

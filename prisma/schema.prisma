@@ -54,3 +54,40 @@ model FollowedTopic {
   name      String   @unique
   createdAt DateTime @default(now())
 }
+
+// One LLM-generated trade signal computed from Binance bar data
+model Signal {
+  id          String   @id @default(cuid())
+  symbol      String // e.g. BTCUSDT
+  interval    String // e.g. 15m
+  // BUY | SELL | WAIT
+  direction   String
+  // 0..1
+  confidence  Float
+  // last close at analysis time
+  price       Float
+  entry       Float
+  entryLow    Float
+  entryHigh   Float
+  stopLoss    Float
+  takeProfit  Float
+  rrRatio     Float
+  // scalp | intraday | swing
+  timeHorizon String @default("intraday")
+  summary     String @default("")
+  // JSON arrays
+  reasons     String @default("[]")
+  risks       String @default("[]")
+  // JSON MarketSnapshot of computed indicators
+  indicators  String @default("{}")
+  // streamed trading-plan prose
+  rationale   String @default("")
+  model       String
+  latencyMs   Int    @default(0)
+  // manual | auto
+  source      String @default("manual")
+  createdAt   DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([symbol, createdAt])
+}

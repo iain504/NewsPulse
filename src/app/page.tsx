@@ -3,6 +3,7 @@
 import * as React from "react";
 import { useTheme } from "next-themes";
 import {
+  Activity,
   BarChart3,
   GraduationCap,
   History,
@@ -21,14 +22,16 @@ import { DashboardPanel } from "@/components/news-sentiment/dashboard-panel";
 import { StudyPanel } from "@/components/news-sentiment/study-panel";
 import { HistoryPanel } from "@/components/news-sentiment/history-panel";
 import { LiveNewsPanel } from "@/components/news-sentiment/live-news-panel";
+import { SignalsPanel } from "@/components/trading/signals-panel";
 import { fetchJSON } from "@/lib/sse-client";
 import type { ModelInfo } from "@/lib/types";
 
 type ApiStatus = "checking" | "online" | "offline";
-type TabKey = "live" | "analyze" | "dashboard" | "study" | "history";
+type TabKey = "live" | "signals" | "analyze" | "dashboard" | "study" | "history";
 
 const TABS: { value: TabKey; label: string; icon: React.ElementType }[] = [
   { value: "live", label: "Live News", icon: Rss },
+  { value: "signals", label: "Signals", icon: Activity },
   { value: "analyze", label: "Analyze", icon: Sparkles },
   { value: "dashboard", label: "Dashboard", icon: BarChart3 },
   { value: "study", label: "Study", icon: GraduationCap },
@@ -133,7 +136,7 @@ export default function Home() {
           onValueChange={(v) => setActiveTab(v as TabKey)}
           className="gap-6"
         >
-          <TabsList className="mx-auto grid h-auto w-full max-w-2xl grid-cols-5 rounded-xl border bg-muted/50 p-1">
+          <TabsList className="mx-auto grid h-auto w-full max-w-3xl grid-cols-6 rounded-xl border bg-muted/50 p-1">
             {TABS.map((tab) => (
               <TabsTrigger
                 key={tab.value}
@@ -154,6 +157,9 @@ export default function Home() {
                 setActiveTab("analyze");
               }}
             />
+          </TabsContent>
+          <TabsContent value="signals">
+            <SignalsPanel />
           </TabsContent>
           <TabsContent value="analyze">
             <AnalyzePanel
@@ -179,7 +185,7 @@ export default function Home() {
           <Newspaper className="size-3.5" aria-hidden />
           <span>NewsPulse — a study lab for news sentiment analysis</span>
           <span aria-hidden>·</span>
-          <span>Powered by Edge0 models · edgezero.space API</span>
+          <span>Market data via Binance public API · Powered by Edge0 models</span>
         </div>
       </footer>
     </div>
