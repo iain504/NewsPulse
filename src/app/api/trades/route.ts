@@ -1,6 +1,7 @@
 import { db } from "@/lib/db";
 import { fetchTicker24h, ClientError } from "@/lib/binance";
-import { buildTradesResponse, toOpenTradeRow } from "@/lib/trades";
+import { accountEquity, buildTradesResponse, toOpenTradeRow } from "@/lib/trades";
+import { computeSizing, roundQty } from "@/lib/sizing";
 import { roundPrice } from "@/lib/format";
 
 export const dynamic = "force-dynamic";
@@ -23,12 +24,29 @@ export async function GET() {
 }
 
 /**
- * POST /api/trades  { signalId, notional, source? }
+ * POST /api/trades  { signalId, autoSize?, notional?, minConfidence?, source? }
+ *
  * Opens a simulated trade from a saved signal, filling at the live market price.
+ *
+ * Sizing modes:
+ *  - autoSize: true  → confidence-driven risk engine: the position is sized so a
+ *    stop-loss hit costs riskPct % of equity, where riskPct = 1% × multiplier and
+ *    the multiplier scales 0.5×…2× linearly with the signal's confidence.
+ *  - autoSize: false → fixed notional in USDT (manual picker).
+ *
+ * Either way the trade stores a sizing snapshot (confidence, riskPct, riskAmount)
+ * so the trade history can show exactly how much was risked and why.
+ *
  * Single-position mode: only ONE trade may be open at a time (long or short).
  */
 export async function POST(req: Request) {
-  let body: { signalId?: unknown; notional?: unknown; source?: unknown };
+  let body: {
+    signalId?: unknown;
+    autoSize?: unknown;
+    notional?: unknown;
+    minConfidence?: unknown;
+    source?: unknown;
+  };
   try {
     body = (await req.json()) as typeof body;
   } catch {
@@ -36,13 +54,25 @@ export async function POST(req: Request) {
   }
 
   const signalId = typeof body.signalId === "string" ? body.signalId.trim() : "";
-  const notional = typeof body.notional === "number" ? body.notional : Number(body.notional);
+  const autoSize = body.autoSize === true;
   const source = body.source === "AUTO" ? "AUTO" : "MANUAL";
+  // Floor of the confidence → risk curve (defaults to the auto-trade threshold).
+  const minConfidenceRaw = typeof body.minConfidence === "number" ? body.minConfidence : 0.7;
+  const minConfidence = Math.min(0.95, Math.max(0.3, minConfidenceRaw));
+
+  let notional: number | null = null;
+  if (!autoSize) {
+    const raw = typeof body.notional === "number" ? body.notional : Number(body.notional);
+    if (!Number.isFinite(raw) || raw < 10 || raw > 1_000_000) {
+      return Response.json(
+        { error: "Position size must be between 10 and 1,000,000 USDT." },
+        { status: 400 },
+      );
+    }
+    notional = raw;
+  }
 
   if (!signalId) return Response.json({ error: "signalId is required." }, { status: 400 });
-  if (!Number.isFinite(notional) || notional < 10 || notional > 1_000_000) {
-    return Response.json({ error: "Position size must be between 10 and 1,000,000 USDT." }, { status: 400 });
-  }
 
   try {
     const signal = await db.signal.findUnique({ where: { id: signalId } });
@@ -102,23 +132,67 @@ export async function POST(req: Request) {
       );
     }
 
-    const quantity = Math.max(1e-8, Math.round((notional / price) * 1e6) / 1e6);
+    // ---- position sizing ---------------------------------------------------
+    const equity = await accountEquity();
+    let riskPct: number | null = null;
+    let riskAmount: number | null = null;
+    let positionSize: number;
+
+    if (autoSize) {
+      const sizing = computeSizing({
+        equity,
+        fillPrice: price,
+        stopLoss: signal.stopLoss,
+        confidence: signal.confidence,
+        minConfidence,
+      });
+      if (!sizing) {
+        return Response.json(
+          { error: "Could not size this trade — stop-loss too close to the live price." },
+          { status: 400 },
+        );
+      }
+      positionSize = sizing.notional;
+    } else {
+      positionSize = notional as number;
+    }
+
+    const quantity = Math.max(1e-8, roundQty(positionSize / price));
+
+    // Risk snapshot for every trade (fixed mode too) so history can display it.
+    const stopDistance = Math.abs(price - signal.stopLoss);
+    riskAmount = quantity * stopDistance;
+    riskPct = equity > 0 ? (riskAmount / equity) * 100 : null;
 
     const trade = await db.trade.create({
       data: {
-        signalId: signal.id,
+        signal: { connect: { id: signal.id } },
         symbol: signal.symbol,
         direction: signal.direction,
         entryPrice: price,
         stopLoss: signal.stopLoss,
         takeProfit: signal.takeProfit,
         quantity,
-        notional,
+        notional: positionSize,
+        confidence: signal.confidence,
+        riskPct,
+        riskAmount,
         source,
       },
     });
 
-    return Response.json({ ok: true, trade: toOpenTradeRow(trade, price) }, { status: 201 });
+    const enriched = await db.trade.findUnique({
+      where: { id: trade.id },
+      include: { signal: true },
+    });
+    if (!enriched) {
+      return Response.json({ error: "Trade vanished right after creation." }, { status: 500 });
+    }
+
+    return Response.json(
+      { ok: true, trade: toOpenTradeRow(enriched, price), riskPct, riskAmount },
+      { status: 201 },
+    );
   } catch (err) {
     return Response.json(
       { error: err instanceof Error ? err.message : "Failed to open trade." },

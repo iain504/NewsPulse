@@ -49,6 +49,7 @@ import {
   type ChartMarker,
   type MarketSnapshot,
   type OpenTradeRow,
+  type SizingMode,
   type SignalRow,
   type StructuredSignal,
   type TickerRow,
@@ -120,7 +121,7 @@ export function SignalsPanel() {
   const [minRR, setMinRR] = React.useState(1.8);
   const [autoLog, setAutoLog] = React.useState<AutoLogEntry[]>([]);
   const autoLogIdRef = React.useRef(0);
-  const autoCfgRef = React.useRef({ autoTradeOn, minConfidence, minRR, notional: 500 });
+  const autoCfgRef = React.useRef({ autoTradeOn, minConfidence, minRR });
   const autoSignalRef = React.useRef<StructuredSignal | null>(null);
 
   const watchlist = React.useMemo(() => watchItems.map((i) => i.symbol), [watchItems]);
@@ -136,6 +137,7 @@ export function SignalsPanel() {
   const [trades, setTrades] = React.useState<TradesResponse | null>(null);
   const [tradesLoading, setTradesLoading] = React.useState(true);
   const [closingId, setClosingId] = React.useState<string | null>(null);
+  const [sizingMode, setSizingMode] = React.useState<SizingMode>("auto");
   const [notional, setNotional] = React.useState(500);
   const [simulatingId, setSimulatingId] = React.useState<string | null>(null);
   const openIdsRef = React.useRef<Set<string>>(new Set());
@@ -198,11 +200,30 @@ export function SignalsPanel() {
     localStorage.setItem("np.autotrade", JSON.stringify({ minConfidence, minRR }));
   }, [minConfidence, minRR]);
 
+  // restore position-sizing preference (mode + fixed amount)
+  React.useEffect(() => {
+    try {
+      const saved = localStorage.getItem("np.sizing");
+      if (!saved) return;
+      const cfg = JSON.parse(saved) as { mode?: string; fixed?: number };
+      if (cfg.mode === "auto" || cfg.mode === "fixed") setSizingMode(cfg.mode);
+      if (typeof cfg.fixed === "number" && cfg.fixed >= 10 && cfg.fixed <= 1_000_000) {
+        setNotional(cfg.fixed);
+      }
+    } catch {
+      // ignore malformed storage
+    }
+  }, []);
+
+  React.useEffect(() => {
+    localStorage.setItem("np.sizing", JSON.stringify({ mode: sizingMode, fixed: notional }));
+  }, [sizingMode, notional]);
+
   // keep the auto-trade config available to long-lived scan closures without
   // re-creating the callbacks mid-run
   React.useEffect(() => {
-    autoCfgRef.current = { autoTradeOn, minConfidence, minRR, notional };
-  }, [autoTradeOn, minConfidence, minRR, notional]);
+    autoCfgRef.current = { autoTradeOn, minConfidence, minRR };
+  }, [autoTradeOn, minConfidence, minRR]);
 
   // ---- DB-backed watchlist ----
   const loadWatchlist = React.useCallback(async () => {
@@ -347,17 +368,28 @@ export function SignalsPanel() {
       }
 
       try {
-        const res = await fetchJSON<{ ok: boolean; trade: OpenTradeRow }>("/api/trades", {
+        const res = await fetchJSON<{
+          ok: boolean;
+          trade: OpenTradeRow;
+          riskPct: number | null;
+          riskAmount: number | null;
+        }>("/api/trades", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ signalId: sigId, notional: cfg.notional, source: "AUTO" }),
+          body: JSON.stringify({
+            signalId: sigId,
+            autoSize: true,
+            minConfidence: cfg.minConfidence / 100,
+            source: "AUTO",
+          }),
         });
+        const risk = res.riskAmount !== null ? `risk ${formatPrice(res.riskAmount)} USDT (${(res.riskPct ?? 0).toFixed(2)}%)` : "";
         pushAutoLog(
-          `${label} opened @ ${formatPrice(res.trade.entryPrice)} · ${res.trade.notional.toLocaleString()} USDT · R:R ${sig.rrRatio.toFixed(2)} · ${confPct}%`,
+          `${label} opened @ ${formatPrice(res.trade.entryPrice)} · ${res.trade.notional.toLocaleString()} USDT${risk ? ` · ${risk}` : ""} · R:R ${sig.rrRatio.toFixed(2)} · ${confPct}%`,
           "opened",
         );
         toast.success(`Auto-trade opened — ${label} @ ${formatPrice(res.trade.entryPrice)}`, {
-          description: `confidence ${confPct}% · R:R ${sig.rrRatio.toFixed(2)} · SL ${formatPrice(res.trade.stopLoss)} · TP ${formatPrice(res.trade.takeProfit)}`,
+          description: `confidence ${confPct}% · R:R ${sig.rrRatio.toFixed(2)} · size ${res.trade.notional.toLocaleString()} USDT${risk ? ` · ${risk}` : ""}`,
         });
         await loadTrades();
       } catch (err) {
@@ -373,14 +405,29 @@ export function SignalsPanel() {
   const simulateTrade = React.useCallback(
     async (sigId: string) => {
       setSimulatingId(sigId);
+      const autoSize = sizingMode === "auto";
       try {
-        const res = await fetchJSON<{ ok: boolean; trade: OpenTradeRow }>("/api/trades", {
+        const res = await fetchJSON<{
+          ok: boolean;
+          trade: OpenTradeRow;
+          riskPct: number | null;
+          riskAmount: number | null;
+        }>("/api/trades", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ signalId: sigId, notional }),
+          body: JSON.stringify({
+            signalId: sigId,
+            autoSize,
+            ...(autoSize ? {} : { notional }),
+            minConfidence: minConfidence / 100,
+          }),
         });
+        const riskTxt =
+          res.riskAmount !== null
+            ? ` · risks ${formatPrice(res.riskAmount)} USDT (${(res.riskPct ?? 0).toFixed(2)}% equity)`
+            : "";
         toast.success(
-          `Paper ${res.trade.direction === "BUY" ? "long" : "short"} opened — ${res.trade.symbol} @ ${formatPrice(res.trade.entryPrice)} · ${res.trade.notional.toLocaleString()} USDT`,
+          `Paper ${res.trade.direction === "BUY" ? "long" : "short"} opened — ${res.trade.symbol} @ ${formatPrice(res.trade.entryPrice)} · ${res.trade.notional.toLocaleString()} USDT${riskTxt}`,
         );
         await loadTrades();
       } catch (err) {
@@ -389,7 +436,7 @@ export function SignalsPanel() {
         setSimulatingId(null);
       }
     },
-    [notional, loadTrades],
+    [sizingMode, notional, minConfidence, loadTrades],
   );
 
   const closeTrade = React.useCallback(
@@ -1006,8 +1053,12 @@ export function SignalsPanel() {
                   !!signalId && signal !== null && signal.direction !== "WAIT" && (trades?.open.length ?? 0) === 0
                 }
                 simulating={!!signalId && simulatingId === signalId}
+                signalId={signalId}
+                sizingMode={sizingMode}
+                onSizingModeChange={setSizingMode}
                 notional={notional}
                 onNotionalChange={setNotional}
+                minConfidence={minConfidence / 100}
                 onSimulate={signalId ? () => void simulateTrade(signalId) : undefined}
                 openTradeHint={
                   (trades?.open.length ?? 0) > 0
@@ -1103,8 +1154,11 @@ export function SignalsPanel() {
                 />
               </div>
             </div>
-            <p className="text-[11px] text-muted-foreground">
-              Position size: {notional.toLocaleString()} USDT — the size picker in the signal card.
+            <p className="text-[11px] leading-relaxed text-muted-foreground">
+              <span className="font-semibold text-foreground">Risk-based sizing:</span> every trade is sized so a
+              stop-loss hit costs a fixed slice of equity — <span className="font-mono">1% base × confidence scale</span>.
+              The scale rises from ×0.5 at the min-confidence slider to ×2.0 at 100% confidence, so stronger signals
+              automatically take bigger (but still capped ×5 equity) positions.
             </p>
           </div>
 

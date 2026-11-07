@@ -4,6 +4,7 @@ import * as React from "react";
 import {
   AlertTriangle,
   CheckCircle2,
+  Gauge,
   Loader2,
   Minus,
   ShieldAlert,
@@ -22,13 +23,16 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { formatPrice } from "@/lib/format";
+import { fetchJSON } from "@/lib/sse-client";
+import { formatPrice, formatQty } from "@/lib/format";
 import {
   NOTIONAL_OPTIONS,
   SIGNAL_META,
   type MarketSnapshot,
   type SignalDirection,
   type StructuredSignal,
+  type SizingMode,
+  type SizingResponse,
 } from "@/lib/types";
 
 export type SignalStatus = "idle" | "fetching" | "thinking" | "ready" | "error";
@@ -46,10 +50,16 @@ interface SignalCardProps {
   latencyMs: number;
   source: string;
   // paper-trading actions (optional)
+  signalId?: string | null;
   canSimulate?: boolean;
   simulating?: boolean;
+  /** "auto" = confidence-driven risk sizing · "fixed" = user-picked USDT amount */
+  sizingMode?: SizingMode;
+  onSizingModeChange?: (m: SizingMode) => void;
   notional?: number;
   onNotionalChange?: (n: number) => void;
+  /** Auto-trade confidence threshold (0..1) — floor of the risk-scaling curve. */
+  minConfidence?: number;
   onSimulate?: () => void;
   openTradeHint?: string | null;
 }
@@ -121,6 +131,85 @@ function PriceLadder({ signal, lastPrice }: { signal: StructuredSignal; lastPric
   );
 }
 
+// ---------------------------------------------------------------------------
+// Confidence-driven sizing preview (server-computed, live price)
+// ---------------------------------------------------------------------------
+
+function SizingPreviewBox({
+  signalId,
+  mode,
+  notional,
+  minConfidence,
+}: {
+  signalId: string;
+  mode: SizingMode;
+  notional: number;
+  minConfidence: number;
+}) {
+  const [data, setData] = React.useState<SizingResponse | null>(null);
+  const [failed, setFailed] = React.useState(false);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    const url =
+      `/api/trades/sizing?signalId=${encodeURIComponent(signalId)}` +
+      `&minConfidence=${minConfidence}` +
+      (mode === "fixed" ? `&notional=${notional}` : "");
+    fetchJSON<SizingResponse>(url)
+      .then((res) => {
+        if (!cancelled) {
+          setData(res);
+          setFailed(false);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setFailed(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [signalId, mode, notional, minConfidence]);
+
+  if (failed) return null;
+  if (!data) {
+    return (
+      <div className="h-12 animate-pulse rounded-lg bg-muted/60" aria-hidden />
+    );
+  }
+
+  const preview = mode === "auto" ? data.auto : data.fixed;
+  if (!preview) return null;
+
+  return (
+    <div
+      className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border border-dashed bg-muted/40 px-2.5 py-1.5 text-[11px] leading-snug"
+      data-testid="sizing-preview"
+    >
+      {mode === "auto" ? (
+        <span className="inline-flex items-center gap-1 font-semibold text-amber-700 dark:text-amber-400">
+          <Gauge className="size-3.5" aria-hidden />
+          ×{preview.multiplier.toFixed(2)} risk scale
+        </span>
+      ) : null}
+      <span>
+        Position <span className="font-mono font-semibold tabular-nums">{formatPrice(preview.notional)}</span> USDT
+      </span>
+      <span>
+        risks{" "}
+        <span className="font-mono font-semibold tabular-nums text-rose-600 dark:text-rose-400">
+          {formatPrice(preview.riskAmount)}
+        </span>{" "}
+        USDT ({preview.riskPct.toFixed(2)}% equity) if SL hits
+      </span>
+      <span className="text-muted-foreground">
+        stop {preview.stopPct.toFixed(2)}% away · qty {formatQty(preview.quantity)} · equity{" "}
+        {formatPrice(data.equity)} USDT
+      </span>
+      {preview.capped ? <span className="font-semibold text-amber-600 dark:text-amber-400">(capped ×5)</span> : null}
+    </div>
+  );
+}
+
 export function SignalCard(props: SignalCardProps) {
   const {
     status,
@@ -134,10 +223,14 @@ export function SignalCard(props: SignalCardProps) {
     model,
     latencyMs,
     source,
+    signalId,
     canSimulate,
     simulating,
+    sizingMode = "auto",
+    onSizingModeChange,
     notional = 500,
     onNotionalChange,
+    minConfidence = 0.7,
     onSimulate,
     openTradeHint,
   } = props;
@@ -168,6 +261,10 @@ export function SignalCard(props: SignalCardProps) {
   const pending = status === "fetching" || status === "thinking";
   const stage = status === "fetching" ? "Fetching Binance bars & computing indicators…" : "Model is reading the tape…";
   const meta = signal ? SIGNAL_META[signal.direction] : null;
+
+  const sizeSelectValue = sizingMode === "auto" ? "auto" : String(notional);
+  const sizeLabel =
+    sizingMode === "auto" ? "auto size" : `${notional.toLocaleString()} USDT`;
 
   return (
     <div className="space-y-4">
@@ -255,44 +352,61 @@ export function SignalCard(props: SignalCardProps) {
                 <span className="text-muted-foreground">{signal.summary}</span>
               </div>
               {onSimulate && (
-                <div className="flex flex-wrap items-center gap-2 border-t pt-3">
+                <div className="space-y-2 border-t pt-3">
                   {canSimulate ? (
                     <>
-                      <Select
-                        value={String(notional)}
-                        onValueChange={(v) => onNotionalChange?.(Number(v))}
-                      >
-                        <SelectTrigger className="h-8 w-32 shrink-0 text-xs" aria-label="Position size in USDT">
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          {NOTIONAL_OPTIONS.map((n) => (
-                            <SelectItem key={n} value={String(n)}>
-                              {n.toLocaleString()} USDT
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                      <Button
-                        size="sm"
-                        disabled={simulating}
-                        onClick={onSimulate}
-                        className={`h-8 flex-1 gap-1.5 font-semibold text-white ${
-                          signal.direction === "BUY"
-                            ? "bg-emerald-600 hover:bg-emerald-500"
-                            : "bg-rose-600 hover:bg-rose-500"
-                        }`}
-                        aria-label={`Simulate a paper ${signal.direction === "BUY" ? "long" : "short"} trade of ${notional} USDT`}
-                      >
-                        {simulating ? (
-                          <Loader2 className="size-4 animate-spin" aria-hidden />
-                        ) : (
-                          <Zap className="size-4" aria-hidden />
-                        )}
-                        {simulating
-                          ? "Placing…"
-                          : `Simulate ${signal.direction === "BUY" ? "long" : "short"} · ${notional.toLocaleString()} USDT`}
-                      </Button>
+                      <div className="flex items-center gap-2">
+                        <Select
+                          value={sizeSelectValue}
+                          onValueChange={(v) => {
+                            if (v === "auto") onSizingModeChange?.("auto");
+                            else {
+                              onSizingModeChange?.("fixed");
+                              onNotionalChange?.(Number(v));
+                            }
+                          }}
+                        >
+                          <SelectTrigger className="h-8 w-44 shrink-0 text-xs" aria-label="Position sizing mode">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="auto">Auto · confidence-based</SelectItem>
+                            {NOTIONAL_OPTIONS.map((n) => (
+                              <SelectItem key={n} value={String(n)}>
+                                Fixed · {n.toLocaleString()} USDT
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                        <Button
+                          size="sm"
+                          disabled={simulating}
+                          onClick={onSimulate}
+                          className={`h-8 flex-1 gap-1.5 font-semibold text-white ${
+                            signal.direction === "BUY"
+                              ? "bg-emerald-600 hover:bg-emerald-500"
+                              : "bg-rose-600 hover:bg-rose-500"
+                          }`}
+                          aria-label={`Simulate a paper ${signal.direction === "BUY" ? "long" : "short"} trade — ${sizeLabel}`}
+                        >
+                          {simulating ? (
+                            <Loader2 className="size-4 animate-spin" aria-hidden />
+                          ) : (
+                            <Zap className="size-4" aria-hidden />
+                          )}
+                          {simulating
+                            ? "Placing…"
+                            : `Simulate ${signal.direction === "BUY" ? "long" : "short"} · ${sizeLabel}`}
+                        </Button>
+                      </div>
+                      {signalId ? (
+                        <SizingPreviewBox
+                          signalId={signalId}
+                          mode={sizingMode}
+                          notional={notional}
+                          minConfidence={minConfidence}
+                        />
+                      ) : null}
                     </>
                   ) : (
                     <p className="text-[11px] text-muted-foreground">

@@ -1,7 +1,18 @@
 "use client";
 
 import * as React from "react";
-import { History, Loader2, Trash2, Wallet, X } from "lucide-react";
+import {
+  BrainCircuit,
+  ChevronDown,
+  ChevronRight,
+  Gauge,
+  History,
+  Loader2,
+  ScrollText,
+  Trash2,
+  Wallet,
+  X,
+} from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -13,12 +24,13 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
-import { formatPct, formatPrice, timeAgo } from "@/lib/format";
+import { formatPct, formatPrice, formatQty, timeAgo, signedUsd } from "@/lib/format";
 import {
   PAPER_START_BALANCE,
   type OpenTradeRow,
   type TradeExitReason,
   type TradeRow,
+  type TradeSignalDetail,
   type TradesResponse,
 } from "@/lib/types";
 
@@ -82,29 +94,173 @@ function SourceChip({ source }: { source: "MANUAL" | "AUTO" }) {
   return null;
 }
 
-// ---------------------------------------------------------------------------
-// Small formatting helpers
-// ---------------------------------------------------------------------------
-
-/** Signed USD P&L: "+12.50" / "-1,234.56" / "0.00". */
-function signedUsd(v: number): string {
-  if (v > 0) return `+${formatPrice(v)}`;
-  if (v < 0) return `-${formatPrice(Math.abs(v))}`;
-  return "0.00";
+/** Compact confidence pill — the model's conviction at open time. */
+function ConfidenceChip({ confidence }: { confidence: number | null }) {
+  if (confidence === null || !Number.isFinite(confidence)) return null;
+  const pct = Math.round(confidence * 100);
+  return (
+    <span
+      className="inline-flex items-center gap-0.5 rounded-md border border-zinc-300 bg-zinc-100 px-1.5 py-0.5 text-[10px] font-bold tabular-nums text-zinc-700 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-300"
+      title={`Signal confidence at open: ${pct}% — position size scaled with this`}
+    >
+      <Gauge className="size-3" aria-hidden />
+      {pct}%
+    </span>
+  );
 }
 
-/** Emerald when positive, rose when negative, zinc when flat. */
-function pnlTextClass(v: number): string {
-  if (v > 0) return "text-emerald-600 dark:text-emerald-400";
-  if (v < 0) return "text-rose-600 dark:text-rose-400";
-  return "text-zinc-600 dark:text-zinc-400";
+/** R:R pill from the originating signal. */
+function RRChip({ rr }: { rr: number | null | undefined }) {
+  if (rr === null || rr === undefined || !Number.isFinite(rr)) return null;
+  return (
+    <span
+      className="rounded-md border border-amber-300 bg-amber-50 px-1.5 py-0.5 text-[10px] font-bold tabular-nums text-amber-800 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-300"
+      title="Reward : risk at signal time"
+    >
+      R:R {rr.toFixed(2)}
+    </span>
+  );
 }
 
-/** Trim to at most 6 decimals, dropping trailing zeros ("1.500000" → "1.5"). */
-function formatQty(q: number): string {
-  if (!Number.isFinite(q)) return "0";
-  const s = q.toFixed(6).replace(/\.?0+$/, "");
-  return s === "" ? "0" : s;
+// ---------------------------------------------------------------------------
+// Signal detail — analyst reason, levels, sizing, streamed plan
+// ---------------------------------------------------------------------------
+
+function DetailRow({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div className="min-w-0">
+      <p className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">{label}</p>
+      <div className="truncate text-xs font-semibold tabular-nums">{children}</div>
+    </div>
+  );
+}
+
+function TradeSignalDetailPanel({ sig }: { sig: TradeSignalDetail }) {
+  return (
+    <div className="space-y-3 rounded-xl border bg-muted/20 p-3" data-testid="trade-signal-detail">
+      {/* confidence */}
+      <div className="space-y-1">
+        <div className="flex items-center justify-between text-[11px]">
+          <span className="flex items-center gap-1 font-semibold text-muted-foreground">
+            <Gauge className="size-3.5 text-amber-500" aria-hidden />
+            Signal confidence
+          </span>
+          <span className="font-mono font-bold tabular-nums">{Math.round(sig.confidence * 100)}%</span>
+        </div>
+        <Progress value={sig.confidence * 100} className="h-1.5" aria-label="Signal confidence" />
+      </div>
+
+      {/* signal facts */}
+      <div className="grid grid-cols-2 gap-x-4 gap-y-2 sm:grid-cols-4">
+        <DetailRow label="Model">{sig.model}</DetailRow>
+        <DetailRow label="Bars">{sig.interval}</DetailRow>
+        <DetailRow label="Horizon" >
+          <span className="capitalize">{sig.timeHorizon}</span>
+        </DetailRow>
+        <DetailRow label="R : R">{sig.rrRatio.toFixed(2)}</DetailRow>
+        <DetailRow label="Entry zone">
+          {formatPrice(sig.entryLow)}–{formatPrice(sig.entryHigh)}
+        </DetailRow>
+        <DetailRow label="Stop loss">
+          <span className={SL_TEXT}>{formatPrice(sig.stopLoss)}</span>
+        </DetailRow>
+        <DetailRow label="Take profit">
+          <span className={TP_TEXT}>{formatPrice(sig.takeProfit)}</span>
+        </DetailRow>
+        <DetailRow label="Signal age">{timeAgo(sig.createdAt)}</DetailRow>
+      </div>
+
+      {/* analyst verdict */}
+      {sig.summary ? (
+        <p className="text-xs leading-relaxed">
+          <span className="font-semibold">Analyst verdict: </span>
+          {sig.summary}
+        </p>
+      ) : null}
+
+      {/* why / risks */}
+      {sig.reasons.length > 0 && (
+        <div>
+          <p className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-emerald-600 dark:text-emerald-400">
+            Why the analyst took this trade
+          </p>
+          <ul className="space-y-1">
+            {sig.reasons.map((r, i) => (
+              <li key={i} className="flex gap-1.5 text-xs leading-relaxed">
+                <span className="mt-1.5 size-1 shrink-0 rounded-full bg-emerald-500" aria-hidden />
+                <span>{r}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {sig.risks.length > 0 && (
+        <div>
+          <p className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-amber-600 dark:text-amber-400">
+            Risks acknowledged
+          </p>
+          <ul className="space-y-1">
+            {sig.risks.map((r, i) => (
+              <li key={i} className="flex gap-1.5 text-xs leading-relaxed">
+                <span className="mt-1.5 size-1 shrink-0 rounded-full bg-amber-500" aria-hidden />
+                <span>{r}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {/* streamed trading plan */}
+      {sig.rationale ? (
+        <div className="rounded-lg border bg-background p-2.5">
+          <p className="mb-1 flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+            <ScrollText className="size-3.5" aria-hidden />
+            Analyst trading plan
+          </p>
+          <div className="custom-scrollbar max-h-48 space-y-2 overflow-y-auto pr-1 text-xs leading-relaxed text-muted-foreground">
+            {sig.rationale.split(/\n+/).map((para, i) => (
+              <p key={i}>{para}</p>
+            ))}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/** Sizing snapshot row (how big / how much at risk). */
+function TradeSizingPanel({
+  notional,
+  quantity,
+  riskAmount,
+  riskPct,
+  entryPrice,
+}: {
+  notional: number;
+  quantity: number;
+  riskAmount: number | null;
+  riskPct: number | null;
+  entryPrice: number;
+}) {
+  return (
+    <div className="grid grid-cols-2 gap-x-4 gap-y-2 rounded-xl border p-3 sm:grid-cols-4">
+      <DetailRow label="Position size">
+        {formatPrice(notional)} USDT
+      </DetailRow>
+      <DetailRow label="Quantity">{formatQty(quantity)}</DetailRow>
+      <DetailRow label="Risk if SL hit">
+        {riskAmount !== null ? (
+          <span className={SL_TEXT}>{formatPrice(riskAmount)} USDT</span>
+        ) : (
+          "—"
+        )}
+      </DetailRow>
+      <DetailRow label="Risk / equity">
+        {riskPct !== null ? `${riskPct.toFixed(2)}%` : "—"}
+      </DetailRow>
+      <DetailRow label="Fill (entry)">{formatPrice(entryPrice)}</DetailRow>
+    </div>
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -145,6 +301,7 @@ function OpenPositionItem({
 }: OpenPositionItemProps) {
   const isLong = t.direction === "BUY";
   const progress = Math.max(0, Math.min(100, t.progressPct));
+  const [expanded, setExpanded] = React.useState(false);
 
   return (
     <div className="rounded-xl border p-3">
@@ -153,6 +310,8 @@ function OpenPositionItem({
           {isLong ? "LONG" : "SHORT"}
         </Badge>
         <SourceChip source={t.source} />
+        <ConfidenceChip confidence={t.confidence} />
+        <RRChip rr={t.signal?.rrRatio} />
         <button
           type="button"
           onClick={() => onSelectSymbol(t.symbol)}
@@ -167,6 +326,21 @@ function OpenPositionItem({
           <span>{signedUsd(t.unrealizedPnl)} USDT</span>
           <span className="text-xs font-semibold">{formatPct(t.unrealizedPct)}</span>
         </span>
+        {t.signal ? (
+          <button
+            type="button"
+            onClick={() => setExpanded((e) => !e)}
+            aria-expanded={expanded}
+            aria-label={expanded ? "Hide signal details" : "Show analyst reason and signal details"}
+            className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+          >
+            {expanded ? (
+              <ChevronDown className="size-4" aria-hidden />
+            ) : (
+              <ChevronRight className="size-4" aria-hidden />
+            )}
+          </button>
+        ) : null}
       </div>
 
       <p className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-muted-foreground">
@@ -191,6 +365,17 @@ function OpenPositionItem({
         <span>
           qty <span className="font-mono tabular-nums">{formatQty(t.quantity)}</span>
         </span>
+        {t.riskAmount !== null ? (
+          <>
+            <span aria-hidden>·</span>
+            <span>
+              risk{" "}
+              <span className={`font-mono tabular-nums ${SL_TEXT}`}>
+                {formatPrice(t.riskAmount)} USDT
+              </span>
+            </span>
+          </>
+        ) : null}
         <span aria-hidden>·</span>
         <span>{timeAgo(t.openedAt)}</span>
       </p>
@@ -218,12 +403,14 @@ function OpenPositionItem({
           {closing ? "Closing…" : "Close"}
         </Button>
       </div>
+
+      {expanded && t.signal ? <TradeSignalDetailPanel sig={t.signal} /> : null}
     </div>
   );
 }
 
 // ---------------------------------------------------------------------------
-// Closed trade row
+// Closed trade row — expandable analyst review
 // ---------------------------------------------------------------------------
 
 interface ClosedTradeItemProps {
@@ -234,43 +421,76 @@ interface ClosedTradeItemProps {
 function ClosedTradeItem({ trade: t, onSelectSymbol }: ClosedTradeItemProps) {
   const isLong = t.direction === "BUY";
   const exit = t.exitReason ? EXIT_CHIP[t.exitReason] : null;
+  const [expanded, setExpanded] = React.useState(false);
 
   return (
-    <div className="flex flex-wrap items-center gap-2 rounded-lg border p-2.5">
-      <span
-        className={`rounded-md border px-1.5 py-0.5 text-[10px] font-bold ${isLong ? LONG_CHIP : SHORT_CHIP}`}
-      >
-        {isLong ? "LONG" : "SHORT"}
-      </span>
-      <SourceChip source={t.source} />
-      <button
-        type="button"
-        onClick={() => onSelectSymbol(t.symbol)}
-        aria-label={`View ${t.symbol} chart`}
-        className="font-mono text-xs font-semibold hover:underline"
-      >
-        {t.symbol}
-      </button>
-      <span className="font-mono text-[11px] tabular-nums text-muted-foreground">
-        {formatPrice(t.entryPrice)} → {t.exitPrice !== null ? formatPrice(t.exitPrice) : "—"}
-      </span>
-      {exit ? (
-        <span className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold ${exit.className}`}>
-          {exit.label}
+    <div className="rounded-lg border p-2.5">
+      <div className="flex flex-wrap items-center gap-2">
+        <span
+          className={`rounded-md border px-1.5 py-0.5 text-[10px] font-bold ${isLong ? LONG_CHIP : SHORT_CHIP}`}
+        >
+          {isLong ? "LONG" : "SHORT"}
         </span>
-      ) : null}
-      <span
-        className={`ml-auto inline-flex items-baseline font-mono text-xs font-bold tabular-nums ${
-          t.pnl !== null ? pnlTextClass(t.pnl) : "text-muted-foreground"
-        }`}
-      >
-        <span>{t.pnl !== null ? `${signedUsd(t.pnl)} USDT` : "—"}</span>
-        {t.pnlPct !== null ? (
-          <span className="ml-1 font-semibold">{formatPct(t.pnlPct)}</span>
+        <SourceChip source={t.source} />
+        <ConfidenceChip confidence={t.confidence} />
+        <RRChip rr={t.signal?.rrRatio} />
+        <button
+          type="button"
+          onClick={() => onSelectSymbol(t.symbol)}
+          aria-label={`View ${t.symbol} chart`}
+          className="font-mono text-xs font-semibold hover:underline"
+        >
+          {t.symbol}
+        </button>
+        <span className="font-mono text-[11px] tabular-nums text-muted-foreground">
+          {formatPrice(t.entryPrice)} → {t.exitPrice !== null ? formatPrice(t.exitPrice) : "—"}
+        </span>
+        {exit ? (
+          <span className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold ${exit.className}`}>
+            {exit.label}
+          </span>
         ) : null}
-      </span>
-      {t.closedAt ? (
-        <span className="text-[10px] text-muted-foreground">{timeAgo(t.closedAt)}</span>
+        <span
+          className={`ml-auto inline-flex items-baseline font-mono text-xs font-bold tabular-nums ${
+            t.pnl !== null ? pnlTextClass(t.pnl) : "text-muted-foreground"
+          }`}
+        >
+          <span>{t.pnl !== null ? `${signedUsd(t.pnl)} USDT` : "—"}</span>
+          {t.pnlPct !== null ? (
+            <span className="ml-1 font-semibold">{formatPct(t.pnlPct)}</span>
+          ) : null}
+        </span>
+        {t.closedAt ? (
+          <span className="text-[10px] text-muted-foreground">{timeAgo(t.closedAt)}</span>
+        ) : null}
+        {t.signal ? (
+          <button
+            type="button"
+            onClick={() => setExpanded((e) => !e)}
+            aria-expanded={expanded}
+            aria-label={expanded ? "Hide trade review" : "Show analyst reason and signal details"}
+            className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+          >
+            {expanded ? (
+              <ChevronDown className="size-4" aria-hidden />
+            ) : (
+              <ChevronRight className="size-4" aria-hidden />
+            )}
+          </button>
+        ) : null}
+      </div>
+
+      {expanded && t.signal ? (
+        <div className="mt-2.5 space-y-2.5">
+          <TradeSizingPanel
+            notional={t.notional}
+            quantity={t.quantity}
+            riskAmount={t.riskAmount}
+            riskPct={t.riskPct}
+            entryPrice={t.entryPrice}
+          />
+          <TradeSignalDetailPanel sig={t.signal} />
+        </div>
       ) : null}
     </div>
   );
@@ -385,6 +605,9 @@ function TradesPanelImpl({
           <CardTitle className="flex items-center gap-2">
             <History className="size-4 text-amber-500" aria-hidden />
             Trade history
+            <span className="text-xs font-normal text-muted-foreground">
+              expand a row for the analyst&apos;s reason, signal levels, confidence &amp; sizing
+            </span>
           </CardTitle>
           <CardAction>
             <Button
@@ -403,11 +626,12 @@ function TradesPanelImpl({
         <CardContent>
           {closed.length === 0 ? (
             <p className="text-sm text-muted-foreground">
-              Closed trades and their P&L will be stored here.
+              Closed trades and their P&L will be stored here — together with the analyst reason and
+              signal details behind each one.
             </p>
           ) : (
             <div
-              className="custom-scrollbar max-h-72 space-y-1.5 overflow-y-auto pr-1"
+              className="custom-scrollbar max-h-96 space-y-1.5 overflow-y-auto pr-1"
               aria-label="Closed paper trades"
             >
               {closed.map((t) => (
@@ -418,14 +642,25 @@ function TradesPanelImpl({
         </CardContent>
       </Card>
 
-      <p className="text-[11px] text-muted-foreground">
-        Paper trades fill at the live Binance price. Single-position mode: one trade at a time — long
-        or short, never both. Positions auto-close when price touches SL or TP (stop-loss is evaluated
-        first if both are hit between refreshes). AUTO marks trades opened by the R:R + confidence
-        engine. Educational simulation — no real funds.
+      <p className="flex items-start gap-1.5 text-[11px] text-muted-foreground">
+        <BrainCircuit className="mt-0.5 size-3.5 shrink-0" aria-hidden />
+        <span>
+          Paper trades fill at the live Binance price. Single-position mode: one trade at a time — long
+          or short, never both. Position size follows risk-based sizing: a stop-loss hit costs
+          1% equity × a confidence scale (×0.5 at the confidence threshold → ×2 at 100%), capped at ×5
+          equity. Positions auto-close when price touches SL or TP (stop-loss evaluated first). AUTO
+          marks trades opened by the R:R + confidence engine. Educational simulation — no real funds.
+        </span>
       </p>
     </div>
   );
+}
+
+/** Emerald when positive, rose when negative, zinc when flat. */
+function pnlTextClass(v: number): string {
+  if (v > 0) return "text-emerald-600 dark:text-emerald-400";
+  if (v < 0) return "text-rose-600 dark:text-rose-400";
+  return "text-zinc-600 dark:text-zinc-400";
 }
 
 export const TradesPanel = React.memo(TradesPanelImpl);

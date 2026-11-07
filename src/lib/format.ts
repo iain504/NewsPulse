@@ -60,3 +60,17 @@ export function timeAgo(iso: string): string {
   if (hrs < 24) return `${hrs}h ago`;
   return `${Math.floor(hrs / 24)}d ago`;
 }
+
+/** Trim to at most 6 decimals, dropping trailing zeros ("1.500000" → "1.5"). */
+export function formatQty(q: number): string {
+  if (!Number.isFinite(q)) return "0";
+  const s = q.toFixed(6).replace(/\.?0+$/, "");
+  return s === "" ? "0" : s;
+}
+
+/** Signed USDT amount: "+12.50" / "-1,234.56" / "0.00". */
+export function signedUsd(v: number): string {
+  if (v > 0) return `+${formatPrice(v)}`;
+  if (v < 0) return `-${formatPrice(Math.abs(v))}`;
+  return "0.00";
+}

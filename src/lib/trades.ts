@@ -8,8 +8,16 @@
 
 import { db } from "@/lib/db";
 import { fetchTickers24h } from "@/lib/binance";
-import { PAPER_START_BALANCE, type OpenTradeRow, type TradeRow, type TradeStats, type TradesResponse, type TradeExitReason } from "@/lib/types";
-import type { Trade } from "@prisma/client";
+import {
+  PAPER_START_BALANCE,
+  type OpenTradeRow,
+  type TradeRow,
+  type TradeSignalDetail,
+  type TradeStats,
+  type TradesResponse,
+  type TradeExitReason,
+} from "@/lib/types";
+import type { Signal, Trade } from "@prisma/client";
 
 export function calcPnl(
   direction: string,
@@ -34,7 +42,52 @@ export function levelProgress(direction: string, stopLoss: number, takeProfit: n
   return Math.max(0, Math.min(100, (done / span) * 100));
 }
 
-export function toTradeRow(t: Trade): TradeRow {
+export function toOpenTradeRow(
+  t: Trade & { signal: Signal | null },
+  currentPrice: number,
+): OpenTradeRow {
+  const { pnl, pnlPct } = calcPnl(t.direction, t.entryPrice, currentPrice, t.quantity, t.notional);
+  return {
+    ...toTradeRow(t),
+    currentPrice,
+    unrealizedPnl: pnl,
+    unrealizedPct: pnlPct,
+    progressPct: levelProgress(t.direction, t.stopLoss, t.takeProfit, currentPrice),
+  };
+}
+
+/** Parse a persisted Signal row into the embeddable analyst-detail snapshot. */
+export function toSignalDetail(s: Signal): TradeSignalDetail {
+  const parseList = (raw: string): string[] => {
+    try {
+      const arr = JSON.parse(raw) as unknown;
+      return Array.isArray(arr) ? arr.filter((x): x is string => typeof x === "string") : [];
+    } catch {
+      return [];
+    }
+  };
+  return {
+    id: s.id,
+    direction: s.direction === "SELL" ? "SELL" : s.direction === "BUY" ? "BUY" : "WAIT",
+    confidence: s.confidence,
+    entry: s.entry,
+    entryLow: s.entryLow,
+    entryHigh: s.entryHigh,
+    stopLoss: s.stopLoss,
+    takeProfit: s.takeProfit,
+    rrRatio: s.rrRatio,
+    interval: s.interval,
+    timeHorizon: s.timeHorizon,
+    summary: s.summary,
+    reasons: parseList(s.reasons),
+    risks: parseList(s.risks),
+    rationale: s.rationale,
+    model: s.model,
+    createdAt: s.createdAt.toISOString(),
+  };
+}
+
+export function toTradeRow(t: Trade & { signal: Signal | null }): TradeRow {
   return {
     id: t.id,
     signalId: t.signalId,
@@ -45,6 +98,9 @@ export function toTradeRow(t: Trade): TradeRow {
     takeProfit: t.takeProfit,
     quantity: t.quantity,
     notional: t.notional,
+    confidence: t.confidence,
+    riskPct: t.riskPct,
+    riskAmount: t.riskAmount,
     status: t.status === "CLOSED" ? "CLOSED" : "OPEN",
     source: t.source === "AUTO" ? "AUTO" : "MANUAL",
     exitPrice: t.exitPrice,
@@ -53,17 +109,7 @@ export function toTradeRow(t: Trade): TradeRow {
     exitReason: (t.exitReason as TradeExitReason | null) ?? null,
     openedAt: t.openedAt.toISOString(),
     closedAt: t.closedAt ? t.closedAt.toISOString() : null,
-  };
-}
-
-export function toOpenTradeRow(t: Trade, currentPrice: number): OpenTradeRow {
-  const { pnl, pnlPct } = calcPnl(t.direction, t.entryPrice, currentPrice, t.quantity, t.notional);
-  return {
-    ...toTradeRow(t),
-    currentPrice,
-    unrealizedPnl: pnl,
-    unrealizedPct: pnlPct,
-    progressPct: levelProgress(t.direction, t.stopLoss, t.takeProfit, currentPrice),
+    signal: t.signal ? toSignalDetail(t.signal) : null,
   };
 }
 
@@ -81,6 +127,31 @@ export async function fetchPriceMap(symbols: string[]): Promise<Map<string, numb
     }
   }
   return map;
+}
+
+/**
+ * Account equity available for risk sizing: start balance + realized P&L,
+ * minus unrealized drawdown on open positions (they still hold margin).
+ */
+export async function accountEquity(): Promise<number> {
+  const rows = await db.trade.findMany({ where: { status: "OPEN" }, include: { signal: true } });
+  let unrealized = 0;
+  if (rows.length > 0) {
+    const priceMap = await fetchPriceMap(rows.map((t) => t.symbol));
+    for (const t of rows) {
+      const price = priceMap.get(t.symbol);
+      if (price && price > 0) {
+        unrealized += calcPnl(t.direction, t.entryPrice, price, t.quantity, t.notional).pnl;
+      }
+    }
+  }
+  const agg = await db.trade.aggregate({
+    where: { status: "CLOSED" },
+    _sum: { pnl: true },
+  });
+  const realized = agg._sum.pnl ?? 0;
+  const equity = PAPER_START_BALANCE + realized + unrealized;
+  return equity > 0 ? equity : PAPER_START_BALANCE;
 }
 
 /**
@@ -125,7 +196,7 @@ export async function evaluateOpenTrades(): Promise<void> {
 export async function buildTradesResponse(): Promise<TradesResponse> {
   await evaluateOpenTrades();
 
-  const rows = await db.trade.findMany({ orderBy: [{ openedAt: "desc" }] });
+  const rows = await db.trade.findMany({ orderBy: [{ openedAt: "desc" }], include: { signal: true } });
   const openRows = rows.filter((r) => r.status === "OPEN");
   const closedRows = rows.filter((r) => r.status === "CLOSED");
 

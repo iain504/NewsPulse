@@ -53,7 +53,12 @@ export async function POST(req: Request) {
       },
     });
 
-    return Response.json({ ok: true, trade: toTradeRow(updated) });
+    const enriched = await db.trade.findUnique({
+      where: { id: updated.id },
+      include: { signal: true },
+    });
+
+    return Response.json({ ok: true, trade: toTradeRow(enriched ?? updated) });
   } catch (err) {
     return Response.json(
       { error: err instanceof Error ? err.message : "Failed to close trade." },

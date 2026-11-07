@@ -109,6 +109,13 @@ model Trade {
   quantity    Float
   // USDT position size at entry
   notional    Float
+  // sizing snapshot at open — confidence-driven risk engine
+  // signal confidence 0..1 at open time
+  confidence  Float?
+  // equity % risked (stop-loss distance × position size)
+  riskPct     Float?
+  // USDT loss if the stop-loss is hit
+  riskAmount  Float?
   // OPEN | CLOSED
   status      String    @default("OPEN")
   // MANUAL | AUTO (auto = opened by the R:R + confidence auto-trade engine)

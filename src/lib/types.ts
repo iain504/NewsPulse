@@ -261,6 +261,29 @@ export type Timeframe = (typeof TIMEFRAMES)[number];
 export type TradeDirection = "BUY" | "SELL";
 export type TradeExitReason = "TP" | "SL" | "MANUAL";
 
+/** Snapshot of the originating signal, embedded in every trade row. */
+export interface TradeSignalDetail {
+  id: string;
+  direction: SignalDirection;
+  /** 0..1 */
+  confidence: number;
+  entry: number;
+  entryLow: number;
+  entryHigh: number;
+  stopLoss: number;
+  takeProfit: number;
+  rrRatio: number;
+  interval: string;
+  timeHorizon: string;
+  summary: string;
+  reasons: string[];
+  risks: string[];
+  /** Streamed analyst rationale ("trading plan") stored with the signal. */
+  rationale: string;
+  model: string;
+  createdAt: string;
+}
+
 export interface TradeRow {
   id: string;
   signalId: string | null;
@@ -271,6 +294,12 @@ export interface TradeRow {
   takeProfit: number;
   quantity: number;
   notional: number;
+  /** Signal confidence (0..1) snapshot at open — from the risk sizing engine. */
+  confidence: number | null;
+  /** Equity % that a stop-loss hit would have cost at open. */
+  riskPct: number | null;
+  /** USDT loss configured at open if the stop-loss is hit. */
+  riskAmount: number | null;
   status: "OPEN" | "CLOSED";
   /** MANUAL = simulated by the user · AUTO = opened by the R:R + confidence engine */
   source: "MANUAL" | "AUTO";
@@ -280,6 +309,8 @@ export interface TradeRow {
   exitReason: TradeExitReason | null;
   openedAt: string;
   closedAt: string | null;
+  /** The originating signal: analyst reason, levels, confidence, model… */
+  signal: TradeSignalDetail | null;
 }
 
 /** OPEN trade enriched with the live market price for unrealized P&L. */
@@ -323,6 +354,38 @@ export interface WatchItemRow {
 
 export const NOTIONAL_OPTIONS = [100, 250, 500, 1000, 5000] as const;
 export const PAPER_START_BALANCE = 10_000;
+
+export type SizingMode = "auto" | "fixed";
+
+/** Server-computed sizing preview for the position-size control. */
+export interface SizingPreview {
+  confidence: number; // 0..100
+  multiplier: number; // 0.5..2
+  riskPct: number; // % of equity
+  riskAmount: number; // USDT at risk if SL hits
+  stopDistance: number;
+  stopPct: number; // % from fill to SL
+  notional: number; // USDT position size
+  quantity: number;
+  capped: boolean;
+  fillPrice: number;
+}
+
+export interface SizingResponse {
+  ok: boolean;
+  equity: number;
+  /** Present when the sizing engine could run (valid stop, live price). */
+  auto: SizingPreview | null;
+  /** Risk info when a fixed notional was requested. */
+  fixed: SizingPreview | null;
+  error?: string;
+}
+
+/** Position-size control presets shown in the signal card. */
+export const SIZING_LABEL: Record<SizingMode, string> = {
+  auto: "Auto · confidence",
+  fixed: "Fixed USDT",
+};
 
 /** A BUY/SELL signal plotted on the candlestick chart. */
 export interface ChartMarker {
