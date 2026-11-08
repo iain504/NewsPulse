@@ -232,7 +232,9 @@ export async function updateEngineConfig(patch: EngineConfigPatch): Promise<Engi
     });
   } else if (!updated.armed && current.armed) {
     await logEngineEvent({ type: "info", message: "Engine DISARMED — scanning and auto-trading stopped." });
-  } else if (updated.armed) {
+  } else {
+    // no armed transition — still audit config changes (armed or not) so the
+    // log shows exactly what the unattended engine will run with
     const changes: string[] = [];
     if (data.scanMinutes !== undefined && data.scanMinutes !== current.scanMinutes) changes.push(`interval ${data.scanMinutes}m`);
     if (data.minConfidence !== undefined && data.minConfidence !== current.minConfidence) {
@@ -244,6 +246,13 @@ export async function updateEngineConfig(patch: EngineConfigPatch): Promise<Engi
     }
     if (data.autoTrade !== undefined && data.autoTrade !== current.autoTrade) {
       changes.push(`auto-trade ${data.autoTrade ? "on" : "off"}`);
+    }
+    if (data.model !== undefined && data.model !== current.model) changes.push(`model ${data.model}`);
+    if (data.interval !== undefined && data.interval !== current.interval) {
+      changes.push(`timeframe ${data.interval}`);
+    }
+    if (data.riskProfile !== undefined && data.riskProfile !== current.riskProfile) {
+      changes.push(`risk profile ${data.riskProfile}`);
     }
     if (changes.length > 0) {
       await logEngineEvent({ type: "info", message: `Engine config updated — ${changes.join(" · ")}.` });

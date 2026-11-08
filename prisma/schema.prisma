@@ -160,8 +160,8 @@ model EngineConfig {
   interval      String   @default("15m")
   // risk profile passed to the model for unattended scans
   riskProfile   String   @default("balanced")
-  // LLM used for unattended scans
-  model         String   @default("edge0-8b")
+  // LLM used for unattended scans (selectable in the UI)
+  model         String   @default("edge0-35b")
   updatedAt     DateTime @updatedAt
 }
 

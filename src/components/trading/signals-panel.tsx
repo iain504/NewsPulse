@@ -122,6 +122,11 @@ export function SignalsPanel() {
   const [scanMinutes, setScanMinutes] = React.useState<number>(15);
   const [minConfidence, setMinConfidence] = React.useState(70);
   const [minRR, setMinRR] = React.useState(1.8);
+  // unattended-scan brain (model / timeframe / risk profile) — persisted on the
+  // server exactly like the armed flags, so every device sees the same config
+  const [engineModel, setEngineModel] = React.useState("edge0-35b");
+  const [engineInterval, setEngineInterval] = React.useState<Timeframe>("15m");
+  const [engineRiskProfile, setEngineRiskProfile] = React.useState("balanced");
   const engineSyncedRef = React.useRef(false);
   const patchDebounceRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -168,11 +173,17 @@ export function SignalsPanel() {
         setScanMinutes(res.config.scanMinutes);
         setMinConfidence(nextMin);
         setMinRR(res.config.minRR);
+        setEngineModel(res.config.model);
+        setEngineInterval(res.config.interval as Timeframe);
+        setEngineRiskProfile(res.config.riskProfile);
       } else if (patchDebounceRef.current === null) {
         // no local edit in flight — adopt the server values (keeps devices in sync)
         setScanMinutes((m) => (m !== res.config.scanMinutes ? res.config.scanMinutes : m));
         setMinConfidence((c) => (c !== nextMin ? nextMin : c));
         setMinRR((r) => (r !== res.config.minRR ? res.config.minRR : r));
+        setEngineModel((m) => (m !== res.config.model ? res.config.model : m));
+        setEngineInterval((iv) => (iv !== res.config.interval ? (res.config.interval as Timeframe) : iv));
+        setEngineRiskProfile((rp) => (rp !== res.config.riskProfile ? res.config.riskProfile : rp));
       }
     } catch {
       // keep the last known state
@@ -1112,6 +1123,88 @@ export function SignalsPanel() {
             </p>
           </div>
 
+          {/* unattended-scan brain — model / timeframe / risk profile, all persisted */}
+          <div className="grid gap-4 sm:grid-cols-3">
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between text-xs">
+                <span className="text-muted-foreground">Auto-scan model</span>
+                <span className="text-[10px] text-muted-foreground">used by auto-trade too</span>
+              </div>
+              <Select
+                value={engineModel}
+                onValueChange={(v) => {
+                  setEngineModel(v);
+                  void updateEngine({ model: v });
+                }}
+              >
+                <SelectTrigger className="h-8 text-xs" aria-label="Model used by the automation engine">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="edge0-35b">edge0-35b · deep (default)</SelectItem>
+                  <SelectItem value="edge0-8b">edge0-8b · fast</SelectItem>
+                </SelectContent>
+              </Select>
+              <p className="text-[10px] leading-relaxed text-muted-foreground">
+                {engineModel === "edge0-35b"
+                  ? "Deep reasoning — sharper verdicts, slower scans."
+                  : "Fast reasoning — quicker cycles, lighter verdicts."}
+              </p>
+            </div>
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between text-xs">
+                <span className="text-muted-foreground">Scan timeframe</span>
+              </div>
+              <Select
+                value={engineInterval}
+                onValueChange={(v) => {
+                  setEngineInterval(v as Timeframe);
+                  void updateEngine({ interval: v });
+                }}
+              >
+                <SelectTrigger className="h-8 text-xs" aria-label="Market data timeframe used by the automation engine">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {TIMEFRAMES.map((tf) => (
+                    <SelectItem key={tf} value={tf}>
+                      {tf}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="text-[10px] leading-relaxed text-muted-foreground">
+                Bars fed to the model for unattended verdicts.
+              </p>
+            </div>
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between text-xs">
+                <span className="text-muted-foreground">Risk profile</span>
+              </div>
+              <Select
+                value={engineRiskProfile}
+                onValueChange={(v) => {
+                  setEngineRiskProfile(v);
+                  void updateEngine({ riskProfile: v });
+                }}
+              >
+                <SelectTrigger className="h-8 text-xs" aria-label="Risk profile used by the automation engine">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {RISK_PROFILES.map((r) => (
+                    <SelectItem key={r.value} value={r.value}>
+                      {r.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="text-[10px] leading-relaxed text-muted-foreground">
+                {RISK_PROFILES.find((r) => r.value === engineRiskProfile)?.hint}
+              </p>
+            </div>
+          </div>
+
           <div className="grid gap-4 md:grid-cols-2">
             <div className="space-y-3">
             <div className="flex flex-wrap items-center gap-2">
@@ -1195,9 +1288,10 @@ export function SignalsPanel() {
                   </p>
                 ) : (
                   <p className="text-sm text-muted-foreground">
-                    Arm the engine and the <span className="font-medium">server</span> will fetch fresh bars
-                    for each selected symbol every {scanMinutes} minutes, ask the model for BUY / SELL / WAIT
-                    verdicts with entry, SL and TP, and file every result into the feed below.
+                    Arm the engine and the <span className="font-medium">server</span> will fetch fresh{" "}
+                    {engineInterval} bars for each selected symbol every {scanMinutes} minutes, ask{" "}
+                    <span className="font-mono font-semibold text-foreground">{engineModel}</span> for
+                    BUY / SELL / WAIT verdicts with entry, SL and TP, and file every result into the feed below.
                   </p>
                 )}
                 <p className="text-[11px] text-muted-foreground">

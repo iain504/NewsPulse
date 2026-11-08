@@ -34,7 +34,15 @@ The automation state (armed flags, thresholds, cadence) is **persisted in the da
 2. when auto-trade is armed, any scan signal clearing the confidence + R:R gates opens a paper trade automatically (single-position mode, confidence-driven sizing)
 3. every decision — scans, verdicts, skips, opens, closes, errors — lands in the `EngineEvent` log, which the UI replays, so everything that happened while you were away is auditable
 
-Arming/disarming and the sliders write through `POST /api/engine`; the UI polls the engine state, so the armed status survives reloads and is shared across devices.
+The unattended brain is fully selectable from the UI and persisted with everything else:
+
+| Setting | Options | Default |
+| --- | --- | --- |
+| **Auto-scan model** | `edge0-35b` (deep reasoning) / `edge0-8b` (fast) | **`edge0-35b`** |
+| Scan timeframe | `5m` / `15m` / `1h` / `4h` / `1d` | `15m` |
+| Risk profile | conservative / balanced / aggressive | `balanced` |
+
+Arming/disarming, the sliders and these selects write through `POST /api/engine`; the UI polls the engine state, so the armed status and every setting survive reloads and are shared across devices.
 
 ### 🎯 Confidence-driven position sizing
 Position size is a function of the model's confidence, so the account risks *more* when the AI is sure and *less* when it isn't:
@@ -128,7 +136,7 @@ Models are expected to be named `edge0-35b` (deep reasoning) and `edge0-8b` (fas
 | `Signal` | LLM trade signal — direction, entry zone, SL, TP, R:R, confidence, indicators snapshot, rationale |
 | `Trade` | Paper trade — linked signal, sizing snapshot (`confidence`, `riskPct`, `riskAmount`), status, exit reason, realised P&L |
 | `WatchItem` | Watchlist symbols flagged for auto-scan |
-| `EngineConfig` | Singleton — persisted automation engine state (armed, autoScan, autoTrade, thresholds, cadence) |
+| `EngineConfig` | Singleton — persisted automation engine state (armed, autoScan, autoTrade, thresholds, cadence, model, timeframe, risk profile) |
 | `EngineEvent` | Server engine activity log |
 
 ## 📁 Project structure
