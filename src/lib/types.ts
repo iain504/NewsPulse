@@ -428,6 +428,20 @@ export interface EngineStatusInfo {
   lastTickAt: string | null;
   lastTickMs: number | null;
   openTrade: { symbol: string; direction: string; openedAt: string } | null;
+  /** WebSocket market feed health (live data, zero request weight) */
+  feed: {
+    connected: boolean;
+    symbols: number;
+    streams: number;
+    lastMsgAt: string | null;
+    reconnects: number;
+  };
+  /** governed Binance REST state (weight budget + IP-ban tracking) */
+  rest: {
+    bannedUntil: string | null;
+    weightUsed: number;
+    budgetPerMin: number;
+  };
 }
 
 export interface EngineEventRow {

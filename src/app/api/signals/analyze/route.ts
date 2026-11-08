@@ -1,5 +1,7 @@
 import { chatCompletion, streamChat } from "@/lib/edgezero";
-import { fetchKlines, fetchTicker24h, isBinanceInterval, isValidSymbol } from "@/lib/binance";
+import { isBinanceInterval, isValidSymbol } from "@/lib/binance";
+import { getCandles } from "@/lib/candle-store";
+import { getTicker24hFromFeed } from "@/lib/market-feed";
 import { extractJsonObject } from "@/lib/sentiment";
 import { buildMarketSnapshot, buildPlanMessages, buildSignalUserPrompt, normalizeSignal, SIGNAL_SYSTEM_PROMPT, type RiskProfile, type StructuredSignal } from "@/lib/signal";
 import { db } from "@/lib/db";
@@ -18,7 +20,7 @@ function sse(event: string, data: unknown): string {
  * POST /api/signals/analyze
  * body: { symbol, interval, model, riskProfile, source }
  *
- * Phase 0 — fetch Binance bars + 24h ticker, compute indicators (deterministic)
+ * Phase 0 — load cached bars (WebSocket-fed) + feed 24h stats, compute indicators (deterministic)
  * Phase 1 — LLM structured verdict: direction / entry / SL / TP (non-streaming JSON)
  * Phase 2 — streamed trading-plan rationale
  * Phase 3 — persist to DB
@@ -60,11 +62,16 @@ export async function POST(req: Request) {
       let rationaleText = "";
 
       try {
-        // Phase 0 — market data (Binance free public API)
-        const [klines, ticker] = await Promise.all([
-          fetchKlines(symbol, interval, 150),
-          fetchTicker24h(symbol).catch(() => null),
-        ]);
+        // Phase 0 — market data from the local cache (zero REST weight)
+        const { candles: klines, stale } = await getCandles(symbol, interval, 150);
+        if (klines.length < 30) {
+          throw new Error(
+            stale
+              ? "Not enough market data cached yet — the WebSocket feed is warming up, retry in a minute."
+              : `Only ${klines.length} bars cached for ${symbol} — retry shortly.`,
+          );
+        }
+        const ticker = getTicker24hFromFeed(symbol);
         const snapshot = buildMarketSnapshot(symbol, interval, klines, ticker);
         send("snapshot", { snapshot });
 

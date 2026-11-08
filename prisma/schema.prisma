@@ -176,3 +176,24 @@ model EngineEvent {
 
   @@index([createdAt])
 }
+
+// Locally cached candle (OHLCV bar). The Binance WebSocket feed keeps this
+// table live (zero request weight) and historical bootstrap fills it once, so
+// charts / scans / the engine never hammer Binance REST again.
+model Kline {
+  id          String   @id @default(cuid())
+  symbol      String
+  interval    String
+  openTimeSec Int // candle open time, epoch seconds
+  open        Float
+  high        Float
+  low         Float
+  close       Float
+  volume      Float
+  quoteVolume Float @default(0)
+  trades      Int   @default(0)
+  updatedAt   DateTime @updatedAt
+
+  @@unique([symbol, interval, openTimeSec])
+  @@index([symbol, interval, openTimeSec])
+}

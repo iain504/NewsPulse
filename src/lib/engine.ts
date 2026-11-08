@@ -18,7 +18,9 @@
  */
 
 import { db } from "@/lib/db";
-import { fetchKlines, fetchTicker24h, isBinanceInterval, isValidSymbol } from "@/lib/binance";
+import { isBinanceInterval, isValidSymbol, binanceRestStatus } from "@/lib/binance";
+import { getCandles } from "@/lib/candle-store";
+import { getTicker24hFromFeed, ensureFeedForWatchlist, feedStatus } from "@/lib/market-feed";
 import { chatCompletion, streamChat } from "@/lib/edgezero";
 import { extractJsonObject } from "@/lib/sentiment";
 import {
@@ -110,6 +112,20 @@ export interface EngineStatusPayload {
   lastTickAt: string | null;
   lastTickMs: number | null;
   openTrade: { symbol: string; direction: string; openedAt: string } | null;
+  /** WebSocket market feed health (zero request weight) */
+  feed: {
+    connected: boolean;
+    symbols: number;
+    streams: number;
+    lastMsgAt: string | null;
+    reconnects: number;
+  };
+  /** governed Binance REST state (ban + weight budget) */
+  rest: {
+    bannedUntil: string | null;
+    weightUsed: number;
+    budgetPerMin: number;
+  };
 }
 
 export async function getEngineStatus(): Promise<EngineStatusPayload> {
@@ -120,6 +136,8 @@ export async function getEngineStatus(): Promise<EngineStatusPayload> {
     orderBy: { openedAt: "desc" },
     select: { symbol: true, direction: true, openedAt: true },
   });
+  const restStatus = binanceRestStatus();
+  const feed = feedStatus();
   return {
     config: {
       armed: cfg.armed,
@@ -139,6 +157,18 @@ export async function getEngineStatus(): Promise<EngineStatusPayload> {
     openTrade: open
       ? { symbol: open.symbol, direction: open.direction, openedAt: open.openedAt.toISOString() }
       : null,
+    feed: {
+      connected: feed.connected,
+      symbols: feed.symbols,
+      streams: feed.streams,
+      lastMsgAt: feed.lastMsgAt,
+      reconnects: feed.reconnects,
+    },
+    rest: {
+      bannedUntil: restStatus.bannedUntil !== null ? new Date(restStatus.bannedUntil).toISOString() : null,
+      weightUsed: restStatus.usedThisMin,
+      budgetPerMin: restStatus.budgetPerMin,
+    },
   };
 }
 
@@ -233,16 +263,25 @@ export async function updateEngineConfig(patch: EngineConfigPatch): Promise<Engi
 // lifecycle
 // ---------------------------------------------------------------------------
 
+/** logs the "re-armed on boot" line only once per server process */
+let bootAnnounced = false;
+
 /** Boot the engine from persisted config — called once per server start. */
 export async function ensureEngine(): Promise<void> {
   try {
+    // always stream the watchlist over the WebSocket feed (zero request
+    // weight) so candles stay warm whether or not the engine is armed
+    void ensureFeedForWatchlist();
     const cfg = await getEngineConfigRow();
     if (cfg.armed) {
       startLoop();
-      await logEngineEvent({
-        type: "info",
-        message: `Server started — engine re-armed from saved config (auto-scan ${cfg.autoScan ? `every ${cfg.scanMinutes} min` : "off"} · auto-trade ${cfg.autoTrade ? "on" : "off"}).`,
-      });
+      if (!bootAnnounced) {
+        bootAnnounced = true;
+        await logEngineEvent({
+          type: "info",
+          message: `Server started — engine re-armed from saved config (auto-scan ${cfg.autoScan ? `every ${cfg.scanMinutes} min` : "off"} · auto-trade ${cfg.autoTrade ? "on" : "off"}).`,
+        });
+      }
     }
   } catch {
     // database not ready yet (e.g. first boot) — the API routes will retry
@@ -279,6 +318,16 @@ async function heartbeat(): Promise<void> {
       stopLoop();
       return;
     }
+    // settle open trades on every heartbeat — with feed prices this costs no
+    // REST weight, so SL/TP fills happen within ~20s of the level being hit
+    if (!rt.running && !settling) {
+      settling = true;
+      try {
+        await evaluateOpenTrades();
+      } finally {
+        settling = false;
+      }
+    }
     if (rt.running) return;
     if (rt.nextTickAt === null) {
       rt.nextTickAt = Date.now() + cfg.scanMinutes * 60_000;
@@ -294,6 +343,9 @@ async function heartbeat(): Promise<void> {
     // heartbeat must never throw
   }
 }
+
+/** guards against overlapping SL/TP settlement (cheap, idempotent anyway) */
+let settling = false;
 
 /** Trigger one full cycle immediately (the UI "Run now" button). */
 export async function triggerEngineCycle(): Promise<{ started: boolean }> {
@@ -390,10 +442,18 @@ async function scanSymbol(symbol: string, cfg: EngineConfigRow): Promise<void> {
   const startedAt = Date.now();
   const interval = isBinanceInterval(cfg.interval) ? cfg.interval : "15m";
 
-  const [klines, ticker] = await Promise.all([
-    fetchKlines(symbol, interval, 150),
-    fetchTicker24h(symbol).catch(() => null),
-  ]);
+  // candles from the local cache (WebSocket-fed, bootstrapped once) + the
+  // 24h stats from the miniTicker stream — zero Binance REST weight
+  const { candles: klines } = await getCandles(symbol, interval, 150);
+  if (klines.length < 30) {
+    await logEngineEvent({
+      type: "skip",
+      symbol,
+      message: `${symbol} skipped — only ${klines.length} cached bars so far, waiting for the feed to warm up (needs ≥30).`,
+    });
+    return;
+  }
+  const ticker = getTicker24hFromFeed(symbol);
   const snapshot = buildMarketSnapshot(symbol, interval, klines, ticker);
 
   // Phase 1 — structured verdict

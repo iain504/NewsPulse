@@ -1010,6 +1010,26 @@ export function SignalsPanel() {
           </div>
         </CardHeader>
         <CardContent className="space-y-4">
+          {/* market data feed status — WebSocket first, REST governed */}
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 rounded-xl border bg-muted/30 px-3 py-2">
+            <p className="flex items-center gap-1.5 text-xs font-semibold">
+              <span
+                className={`size-2 rounded-full ${
+                  engine?.feed?.connected ? "bg-emerald-500 animate-pulse" : "bg-amber-500"
+                }`}
+                aria-hidden
+              />
+              {engine?.feed?.connected
+                ? `Live WebSocket feed · ${engine.feed.symbols} symbol${engine.feed.symbols === 1 ? "" : "s"} · ${engine.feed.streams} streams`
+                : "Market feed connecting…"}
+            </p>
+            <p className="text-[11px] text-muted-foreground">
+              {engine?.rest?.bannedUntil
+                ? `Binance REST banned until ${new Date(engine.rest.bannedUntil).toLocaleTimeString([], { hour12: false })} — WebSocket keeps data live`
+                : `Binance REST governed · ${engine?.rest?.weightUsed ?? 0}/${engine?.rest?.budgetPerMin ?? 40} weight per min (used only for one-time history bootstrap)`}
+            </p>
+          </div>
+
           {/* auto-trade engine */}
           <div
             className={`space-y-3 rounded-xl border p-3 transition-colors ${

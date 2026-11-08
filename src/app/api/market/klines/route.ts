@@ -1,4 +1,6 @@
-import { fetchKlines, fetchTicker24h, isBinanceInterval, isValidSymbol } from "@/lib/binance";
+import { isBinanceInterval, isValidSymbol, type Ticker24h } from "@/lib/binance";
+import { getCandles } from "@/lib/candle-store";
+import { getTicker24hFromFeed, feedStatus } from "@/lib/market-feed";
 
 export const dynamic = "force-dynamic";
 
@@ -17,11 +19,20 @@ export async function GET(req: Request) {
   }
 
   try {
-    const [candles, ticker] = await Promise.all([
-      fetchKlines(symbol, interval, Number.isFinite(limit) ? limit : 150),
-      fetchTicker24h(symbol).catch(() => null),
-    ]);
-    return Response.json({ ok: true, symbol, interval, candles, ticker });
+    // cache-first: served from the local Kline table that the WebSocket feed
+    // keeps live — Binance REST is never polled for routine chart reads
+    const { candles, source, stale } = await getCandles(symbol, interval, Number.isFinite(limit) ? limit : 150);
+    const ticker: Ticker24h | null = getTicker24hFromFeed(symbol);
+    return Response.json({
+      ok: true,
+      symbol,
+      interval,
+      candles,
+      ticker,
+      source,
+      stale,
+      feed: feedStatus(),
+    });
   } catch (err) {
     return Response.json(
       { error: err instanceof Error ? err.message : "Failed to load market data." },

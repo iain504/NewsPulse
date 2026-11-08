@@ -1,5 +1,5 @@
 import { db } from "@/lib/db";
-import { fetchTicker24h, ClientError } from "@/lib/binance";
+import { resolveSpotPrice } from "@/lib/trades";
 import { calcPnl, toTradeRow } from "@/lib/trades";
 
 export const dynamic = "force-dynamic";
@@ -28,15 +28,10 @@ export async function POST(req: Request) {
       return Response.json({ error: "This trade is already closed." }, { status: 400 });
     }
 
-    let price: number;
-    try {
-      price = (await fetchTicker24h(trade.symbol)).lastPrice;
-    } catch (err) {
-      const msg = err instanceof ClientError ? err.message : "Live price unavailable — try again.";
-      return Response.json({ error: msg }, { status: 502 });
-    }
-    if (!(price > 0)) {
-      return Response.json({ error: "Live price unavailable — try again." }, { status: 502 });
+    // fill at the best known price: WebSocket feed → cached close → REST
+    const price = await resolveSpotPrice(trade.symbol);
+    if (!price || !(price > 0)) {
+      return Response.json({ error: "Live price unavailable — the market feed is warming up, try again in a moment." }, { status: 502 });
     }
 
     const { pnl, pnlPct } = calcPnl(trade.direction, trade.entryPrice, price, trade.quantity, trade.notional);

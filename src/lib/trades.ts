@@ -7,7 +7,7 @@
  */
 
 import { db } from "@/lib/db";
-import { fetchTicker24h, fetchTickers24h, ClientError } from "@/lib/binance";
+import { resolveSpotPrices } from "@/lib/market-feed";
 import { computeSizing, roundQty } from "@/lib/sizing";
 import { roundPrice } from "@/lib/format";
 import { logEngineEvent } from "@/lib/engine-events";
@@ -116,20 +116,20 @@ export function toTradeRow(t: Trade & { signal: Signal | null }): TradeRow {
   };
 }
 
-/** Batched last-price lookup with chunking (Binance accepts ≤12 symbols per call). */
+/**
+ * Batched last-price lookup with zero REST weight whenever the WebSocket
+ * feed / local candle cache can answer (resolveSpotPrices falls back to one
+ * governed REST call only for symbols with no local data at all).
+ */
 export async function fetchPriceMap(symbols: string[]): Promise<Map<string, number>> {
-  const map = new Map<string, number>();
-  const unique = [...new Set(symbols)].filter((s) => s.length > 0);
-  for (let i = 0; i < unique.length; i += 12) {
-    const chunk = unique.slice(i, i + 12);
-    try {
-      const tickers = await fetchTickers24h(chunk);
-      for (const t of tickers) if (t.lastPrice > 0) map.set(t.symbol, t.lastPrice);
-    } catch {
-      // chunk unavailable — skip; callers fall back to entry price
-    }
-  }
-  return map;
+  return resolveSpotPrices(symbols);
+}
+
+/** Single-symbol price: feed → cached candle close → governed REST fallback. */
+export async function resolveSpotPrice(symbol: string): Promise<number | null> {
+  const map = await resolveSpotPrices([symbol]);
+  const price = map.get(symbol.toUpperCase());
+  return price && price > 0 ? price : null;
 }
 
 /**
@@ -267,15 +267,10 @@ export async function openTradeFromSignal(params: OpenTradeParams): Promise<Open
     };
   }
 
-  let price: number;
-  try {
-    price = (await fetchTicker24h(signal.symbol)).lastPrice;
-  } catch (err) {
-    const msg = err instanceof ClientError ? err.message : "Live price unavailable — try again.";
-    return { ok: false, status: 502, error: msg };
-  }
-  if (!(price > 0)) {
-    return { ok: false, status: 502, error: "Live price unavailable — try again." };
+  // Fill at the best known price: WebSocket feed → cached close → REST.
+  const price = await resolveSpotPrice(signal.symbol);
+  if (!price || !(price > 0)) {
+    return { ok: false, status: 502, error: "Live price unavailable — the market feed is warming up, try again in a moment." };
   }
 
   // Guard against fills that would instantly resolve the position.

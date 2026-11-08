@@ -1,5 +1,6 @@
 import { db } from "@/lib/db";
-import { fetchTicker24h, ClientError, isValidSymbol } from "@/lib/binance";
+import { fetchTicker24h, BinanceBanError, ClientError, isValidSymbol } from "@/lib/binance";
+import { ensureSymbols, removeSymbols } from "@/lib/market-feed";
 import { DEFAULT_SYMBOLS } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
@@ -54,20 +55,42 @@ export async function POST(req: Request) {
       );
     }
 
-    // Verify the ticker actually exists on Binance before saving.
+    // Verify the ticker actually exists before saving — but stay usable while
+    // Binance REST is banned (weight ban): accept the symbol unverified then.
+    let verified = true;
     try {
       await fetchTicker24h(symbol);
     } catch (err) {
-      const msg =
-        err instanceof ClientError
-          ? `${symbol} not found on Binance — check the ticker.`
-          : "Could not verify the symbol on Binance — try again.";
-      return Response.json({ error: msg }, { status: err instanceof ClientError ? 400 : 502 });
+      if (err instanceof BinanceBanError) {
+        verified = false; // REST refused our IP — create unverified below
+      } else if (err instanceof ClientError) {
+        return Response.json(
+          { error: `${symbol} not found on Binance — check the ticker.` },
+          { status: 400 },
+        );
+      } else {
+        return Response.json(
+          { error: "Could not verify the symbol on Binance — try again." },
+          { status: 502 },
+        );
+      }
     }
 
     const item = await db.watchItem.create({ data: { symbol } });
+    // start streaming this symbol over the WebSocket feed immediately
+    ensureSymbols([symbol]);
     return Response.json(
-      { ok: true, item: { id: item.id, symbol: item.symbol, scan: item.scan, createdAt: item.createdAt.toISOString() } },
+      {
+        ok: true,
+        item: { id: item.id, symbol: item.symbol, scan: item.scan, createdAt: item.createdAt.toISOString() },
+        verified,
+        ...(verified
+          ? {}
+          : {
+              warning:
+                "Binance REST is banned — symbol accepted unverified; it will be checked when the market feed warms up.",
+            }),
+      },
       { status: 201 },
     );
   } catch (err) {
@@ -101,10 +124,7 @@ export async function PATCH(req: Request) {
       item: { id: item.id, symbol: item.symbol, scan: item.scan, createdAt: item.createdAt.toISOString() },
     });
   } catch (err) {
-    return Response.json(
-      { error: err instanceof Error ? err.message : "Failed to update symbol." },
-      { status: 500 },
-    );
+    return Response.json({ error: err instanceof Error ? err.message : "Failed to update symbol." }, { status: 500 });
   }
 }
 
@@ -119,6 +139,7 @@ export async function DELETE(req: Request) {
 
   try {
     await db.watchItem.deleteMany({ where: { symbol } });
+    removeSymbols([symbol]); // stop streaming it
     return Response.json({ ok: true });
   } catch (err) {
     return Response.json(

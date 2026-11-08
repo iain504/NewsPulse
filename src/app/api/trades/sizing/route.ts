@@ -1,6 +1,5 @@
 import { db } from "@/lib/db";
-import { fetchTicker24h } from "@/lib/binance";
-import { accountEquity } from "@/lib/trades";
+import { accountEquity, resolveSpotPrice } from "@/lib/trades";
 import { computeSizing, roundQty } from "@/lib/sizing";
 import type { SizingPreview, SizingResponse } from "@/lib/types";
 
@@ -37,11 +36,10 @@ export async function GET(req: Request) {
       return Response.json({ ok: true, equity: 0, auto: null, fixed: null });
     }
 
-    const [equity, ticker] = await Promise.all([
+    const [equity, fillPrice] = await Promise.all([
       accountEquity(),
-      fetchTicker24h(signal.symbol).catch(() => null),
+      resolveSpotPrice(signal.symbol).then((p) => p ?? signal.price),
     ]);
-    const fillPrice = ticker?.lastPrice ?? signal.price;
     if (!(fillPrice > 0) || !(equity > 0)) {
       return Response.json({ ok: true, equity, auto: null, fixed: null });
     }
